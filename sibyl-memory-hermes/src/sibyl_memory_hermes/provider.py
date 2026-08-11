@@ -78,8 +78,9 @@ class SibylMemoryProvider:
         db_path:        path to the local SQLite database. Defaults to
                         ~/.sibyl-memory/memory.db (the path `sibyl init`
                         creates).
-        tenant_id:      explicit tenant override. If None, credentials.json
-                        is loaded and tenant resolves via the canonical ladder
+        tenant_id:      explicit tenant override. Credentials are still loaded
+                        for account, tier, and session metadata. If None,
+                        tenant resolves via the canonical ladder
                         tenant_id -> account_id -> DEFAULT_TENANT; DEFAULT_TENANT
                         is used only when credentials are genuinely absent.
         credentials_path: override for credentials.json discovery.
@@ -99,37 +100,28 @@ class SibylMemoryProvider:
         require_credentials: bool = False,
         autoload_credentials: bool = True,
     ) -> None:
-        # Resolve tenant: explicit > credentials (tenant_id > account_id) > default
-        resolved_tenant = tenant_id
         creds: Credentials | None = None
-
-        if resolved_tenant is None and autoload_credentials:
+        if autoload_credentials:
             try:
                 creds = load_credentials(credentials_path)
-                # Contract T (super-patch 2026-07-05): ONE canonical tenant
-                # ladder shared by every surface (client / mcp / hermes /
-                # langgraph) -- tenant_id -> account_id -> DEFAULT_TENANT.
-                # An activated user whose credentials.json carries an account
-                # but a missing-or-empty tenant_id (legacy schema-v1 files, or
-                # a present-but-empty tenant field the loader does not mirror)
-                # must resolve to their OWN account, never the shared
-                # DEFAULT_TENANT constant. `or` collapses both the absent and
-                # the present-but-empty cases; DEFAULT_TENANT is reached only
-                # when credentials are genuinely absent (the except arms below).
-                resolved_tenant = (
-                    creds.tenant_id or creds.account_id or DEFAULT_TENANT
-                )
             except CredentialsNotFoundError:
                 if require_credentials:
                     raise
-                resolved_tenant = DEFAULT_TENANT
             except (OSError, ValueError):
                 if require_credentials:
                     raise
-                resolved_tenant = DEFAULT_TENANT
 
+        # Contract T (super-patch 2026-07-05): ONE canonical tenant ladder
+        # shared by every surface. An explicit routing override must not skip
+        # credential loading because account, tier, token, and signature remain
+        # independent client metadata.
+        resolved_tenant = tenant_id
         if resolved_tenant is None:
-            resolved_tenant = DEFAULT_TENANT
+            resolved_tenant = (
+                creds.tenant_id or creds.account_id or DEFAULT_TENANT
+                if creds is not None
+                else DEFAULT_TENANT
+            )
 
         self._credentials = creds
         # Plumb account_id, session_token, tier, and the HMAC-signed

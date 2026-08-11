@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import secrets
 import threading
@@ -328,6 +329,12 @@ class SibylAdapter(MemoryProvider):
     def initialize(self, session_id: str, **kwargs: Any) -> None:
         from sibyl_memory_hermes import SibylMemoryProvider
 
+        configured_tenant = os.environ.get("SIBYL_TENANT_ID")
+        if configured_tenant is not None:
+            configured_tenant = configured_tenant.strip()
+            if not configured_tenant:
+                raise ValueError("SIBYL_TENANT_ID must not be empty")
+
         self._session_id = session_id
         hermes_home_raw = kwargs.get("hermes_home") or str(_hermes_home())
         self._hermes_home = Path(hermes_home_raw)
@@ -356,11 +363,17 @@ class SibylAdapter(MemoryProvider):
         # to DEFAULT_TENANT pre-activation rather than crash on first run.
         self._sibyl = SibylMemoryProvider(
             db_path=db_path,
+            tenant_id=configured_tenant,
             autoload_credentials=True,
             require_credentials=False,
         )
-        logger.info("Sibyl memory initialized: db=%s session=%s profile=%s",
-                    db_path, session_id, self._profile)
+        logger.info(
+            "Sibyl memory initialized: db=%s session=%s profile=%s tenant=%s",
+            db_path,
+            session_id,
+            self._profile,
+            self._sibyl.tenant_id,
+        )
 
     @staticmethod
     def _safe_profile(name: str) -> str:

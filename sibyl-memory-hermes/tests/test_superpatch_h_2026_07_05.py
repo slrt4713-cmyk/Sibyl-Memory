@@ -21,7 +21,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from sibyl_memory_client import DEFAULT_TENANT
+import pytest
+
+from sibyl_memory_client import DEFAULT_TENANT, TenantError
 
 from sibyl_memory_hermes.provider import SibylMemoryProvider
 
@@ -91,7 +93,15 @@ def test_ladder_uses_default_only_when_creds_absent(tmp_path):
 # ----------------------------------------------------------------------
 def test_explicit_tenant_id_overrides_ladder(tmp_path):
     cred = _write_creds(
-        tmp_path, {"account_id": "acct-9", "tenant_id": "tenant-from-file"}
+        tmp_path,
+        {
+            "account_id": "acct-9",
+            "tenant_id": "tenant-from-file",
+            "tier": "team",
+            "session_token": "session-9",
+            "signature": "a" * 64,
+            "schema_version": 2,
+        },
     )
     prov = SibylMemoryProvider(
         db_path=str(tmp_path / "memory.db"),
@@ -99,3 +109,29 @@ def test_explicit_tenant_id_overrides_ladder(tmp_path):
         credentials_path=str(cred),
     )
     assert prov.tenant_id == "explicit-tenant"
+    assert prov.credentials is not None
+    assert prov.credentials.account_id == "acct-9"
+    assert prov.client.get_tier() == "team"
+    assert prov.client._account_id == "acct-9"
+    assert prov.client._session_token == "session-9"
+    assert prov.client._cap_gate._credentials_signature == "a" * 64
+
+
+def test_explicit_tenant_id_allows_optional_credentials_to_be_absent(tmp_path):
+    prov = SibylMemoryProvider(
+        db_path=str(tmp_path / "memory.db"),
+        tenant_id="explicit-tenant",
+        credentials_path=str(tmp_path / "missing.json"),
+        require_credentials=False,
+    )
+    assert prov.tenant_id == "explicit-tenant"
+    assert prov.credentials is None
+
+
+def test_explicit_empty_tenant_id_is_not_replaced_by_default(tmp_path):
+    with pytest.raises(TenantError):
+        SibylMemoryProvider(
+            db_path=str(tmp_path / "memory.db"),
+            tenant_id="",
+            autoload_credentials=False,
+        )

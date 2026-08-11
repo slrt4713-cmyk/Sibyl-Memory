@@ -90,6 +90,55 @@ def test_tool_schemas_are_valid_openai_function_shape(schema: dict) -> None:
 # ----------------------------------------------------------------------
 # Adapter init + dispatch
 # ----------------------------------------------------------------------
+class _ProviderSpy:
+    calls: list[dict] = []
+
+    def __init__(self, **kwargs):
+        self.calls.append(kwargs)
+        self.tenant_id = kwargs.get("tenant_id") or "credentials-tenant"
+
+
+def test_initialize_uses_configured_tenant(monkeypatch, tmp_path: Path) -> None:
+    _ProviderSpy.calls.clear()
+    monkeypatch.setattr("sibyl_memory_hermes.SibylMemoryProvider", _ProviderSpy)
+    monkeypatch.setenv("SIBYL_TENANT_ID", "lugarno-simon")
+
+    adapter = SibylAdapter()
+    adapter.initialize("session-1", hermes_home=str(tmp_path))
+
+    assert _ProviderSpy.calls == [
+        {
+            "db_path": tmp_path / "sibyl" / "memory.db",
+            "tenant_id": "lugarno-simon",
+            "autoload_credentials": True,
+            "require_credentials": False,
+        }
+    ]
+
+
+def test_initialize_keeps_credential_tenant_when_env_is_absent(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _ProviderSpy.calls.clear()
+    monkeypatch.setattr("sibyl_memory_hermes.SibylMemoryProvider", _ProviderSpy)
+    monkeypatch.delenv("SIBYL_TENANT_ID", raising=False)
+
+    adapter = SibylAdapter()
+    adapter.initialize("session-1", hermes_home=str(tmp_path))
+
+    assert _ProviderSpy.calls[0]["tenant_id"] is None
+
+
+def test_initialize_rejects_empty_configured_tenant(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("SIBYL_TENANT_ID", "  ")
+
+    adapter = SibylAdapter()
+    with pytest.raises(ValueError, match="SIBYL_TENANT_ID must not be empty"):
+        adapter.initialize("session-1", hermes_home=str(tmp_path))
+
+
 def _make_initialized_adapter(tmp_path: Path) -> SibylAdapter:
     """Build a SibylAdapter wired to a temp DB. Bypasses Hermes' real
     initialize() entry point (which calls _hermes_home from hermes_constants)
