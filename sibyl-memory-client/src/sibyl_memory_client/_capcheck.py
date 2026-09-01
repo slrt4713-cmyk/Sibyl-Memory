@@ -62,7 +62,9 @@ from .exceptions import (  # noqa: F401  (re-exported for backwards compat)
 # Constants
 # ----------------------------------------------------------------------
 
-FREE_TIER_CAP_BYTES = 2 * 1024 * 1024  # 2 MB
+# Raised 2026-08-06 (operator directive) from 2 MiB → 5 MiB to compensate for the
+# v0.5.0 folded-trigram search shadow's added on-disk footprint (spec §6).
+FREE_TIER_CAP_BYTES = 5 * 1024 * 1024  # 5 MB (5,242,880 bytes)
 GRACE_PERIOD_SECONDS = 7 * 24 * 60 * 60  # 7 days
 PAID_TIERS = frozenset({"sync", "team", "lifetime", "stake", "enterprise"})
 
@@ -267,7 +269,7 @@ def aggregate_db_size(primary_db: str | Path) -> int:
     machine resolves.
 
     The FREE-tier cap is per ACCOUNT, not per DB file. Sizing only the store
-    being written to lets N stores yield N x 2 MB on one free account
+    being written to lets N stores yield N x 5 MB on one free account
     (Discord report 2026-06-11: 6.29 MB across 9 stores). This walks every
     store an agent on this machine can resolve and sums them:
 
@@ -404,7 +406,7 @@ def _default_check_write_fn(
                 continue
             # T2-3 fix: do NOT synthesize a fake "free tier" decision on HTTP
             # error. Previously a transient 502 would write `{tier:free,
-            # cap_bytes:2MB}` into the cache for a legitimately paid user,
+            # cap_bytes:5MB}` into the cache for a legitimately paid user,
             # locking them out for up to 7 days. Now we raise
             # TierVerificationError: the caller (_refresh_and_check) falls back
             # to a recent cache if one exists, or fails open for no-cache writes.
@@ -634,7 +636,7 @@ class CapGate:
             if new_size <= self._cap:
                 return
             raise CapExceededError(
-                "You're at the 2 MB free-tier cap and your account isn't "
+                "You're at the 5 MB free-tier cap and your account isn't "
                 "activated. Run `sibyl init` to activate, or stay under "
                 "the cap.",
                 current_size=current,
@@ -671,7 +673,7 @@ class CapGate:
                 return
             raise CapExceededError(
                 "Your account could not be authorized and you're past the "
-                "2 MB free-tier cap. Re-run `sibyl init` to refresh "
+                "5 MB free-tier cap. Re-run `sibyl init` to refresh "
                 "credentials, or stay under the cap.",
                 current_size=current,
                 cap=self._cap,
@@ -723,7 +725,7 @@ class CapGate:
                 if new_size <= self._cap:
                     return
                 raise CapExceededError(
-                    "You're past the 2 MB free-tier cap and Sibyl Labs can't be "
+                    "You're past the 5 MB free-tier cap and Sibyl Labs can't be "
                     "reached to verify a paid tier. Reconnect to continue, or "
                     "upgrade.",
                     current_size=current,

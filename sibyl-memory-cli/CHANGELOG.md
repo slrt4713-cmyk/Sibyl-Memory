@@ -4,6 +4,79 @@ All notable changes to `sibyl-memory-cli` are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning follows
 [SemVer](https://semver.org/).
 
+## [0.4.0] "Lucid" - 2026-08-31
+
+Minor version: `sibyl memory search` prints a new `cause:` line on the zero path,
+so anything parsing this command's output should read this entry.
+
+- Floors `sibyl-memory-client>=0.8.0`, `sibyl-memory-hermes>=0.4.0` and, in the
+  `mcp` extra, `sibyl-memory-mcp>=0.2.0`. The CLI prints causes it does not own;
+  an old client underneath a new CLI would leave it printing a cause line for a
+  verdict that is never populated.
+
+### Changed
+- **`sibyl memory search` explains a zero instead of just reporting one** (branch
+  `lang-core-verdict`, 2026-08-31). It used to print `(no matches for 'x')` and
+  stop — the terminal-shaped version of the defect this stage closes, and the
+  reader is usually a new user deciding whether the product works. Saying "no
+  matches" against a store that is simply EMPTY was the single most misleading
+  thing this command could do. It now prints the canonical cause in plain
+  language plus a machine-readable `cause: <code>` line, and pays one count on
+  the zero path so `empty_store` is reported as what it is: a fixable state, not
+  a failed search. The success path is unchanged and prints no extra noise.
+- The cause vocabulary is imported from `sibyl_memory_client.verdicts`; the CLI
+  prints causes, it does not own them. A test asserts it declares none.
+
+## [0.3.23] - 2026-08-22
+
+### Changed
+- Require `sibyl-memory-client>=0.7.0` so `sibyl update` / a fresh install pulls
+  the multi-language search part-4 fixes (N4/N5/N1'-diagnostics: a nonzero-df
+  function word no longer anchors/pollutes ranking, a dropped negation word
+  abstains instead of silently answering the opposite). No CLI code change.
+  See `sibyl-memory-client` 0.7.0 CHANGELOG for the full N4/N3'/N5/N1' detail.
+
+## [0.3.22] - 2026-08-16
+
+### Changed
+- Require `sibyl-memory-client>=0.6.1` so `sibyl update` pulls the multi-language search part-3 fixes (N1/N2/N3: the agent-default MCP path now reaches PL/EN recall parity on question-shaped queries). No CLI code change.
+
+## [0.3.21] - 2026-08-12
+
+Multi-language search, part 2 (Kravento / Bilbo Polish evaluation) — CLI leg.
+
+### Fixed
+- **F1 — `sibyl memory list/search/recall` read the wrong tenant on an
+  activated account.** `cmd_memory` opened the store at the hard-coded
+  `DEFAULT_TENANT` while the MCP server writes under the account's real tenant,
+  so an activated account saw `(no entities)` / `(no matches)` for a perfectly
+  healthy store — the surface that made the Polish eval first look like a recall
+  failure before the linguistic gap was even reached. `cmd_memory` now resolves
+  the tenant from `credentials.json` via the same Contract-T ladder the server
+  uses (`tenant_id -> account_id -> DEFAULT_TENANT`, matching `server.py`), like
+  `status`/`health` already did, with a call-time `--creds` default fallback so
+  direct-`Namespace` unit invocations still resolve. Read-only; no write path
+  touched.
+- **Free-tier cap display corrected: 2 MB to 5 MB.** The `sibyl upgrade`
+  subtitle still showed the pre-2026-08-06 cap; the free-tier local cap was
+  raised to 5 MiB in the 0.5.0 release. Display-only, no logic change.
+
+### Changed
+- **Dependency floor raised to `sibyl-memory-client>=0.6.0`.** `sibyl memory
+  search` / `sibyl recall` now inherit the F2 unconditional-shadow append and
+  the D2L coverage-gated stem rescue, taking Polish recall to parity with
+  English on the eval battery (see `sibyl-memory-client` 0.6.0). No CLI code
+  change for this leg.
+
+## [0.3.20] - 2026-08-06
+
+### Changed
+- **Dependency floor raised to `sibyl-memory-client>=0.5.0`** for multi-language
+  search (schema v4). `sibyl search` / `sibyl recall` now resolve non-ASCII,
+  non-Latin, CJK, Thai, and compound-token queries that previously returned
+  nothing (100-language sweep: 21/100 → 100/100). No CLI code change. See
+  `sibyl-memory-client` 0.5.0.
+
 ## [0.3.19] - 2026-07-05
 
 Super-patch: recovery + adjudication of the remaining Fable 10-lens audit

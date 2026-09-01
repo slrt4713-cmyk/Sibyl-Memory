@@ -4,6 +4,62 @@ All notable changes to `sibyl-memory-langgraph` are recorded here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning
 follows [SemVer](https://semver.org/).
 
+## [0.2.0] "Lucid" - 2026-08-31
+
+Minor version: `SibylStore` gained `last_search_verdict`, and the underlying
+`search_entities` now returns a `list` subclass. `BaseStore.search` still returns
+`list[SearchItem]` and its rows are unchanged.
+
+- Floors `sibyl-memory-client>=0.8.0`, raised from `>=0.5.0`. The store reads a
+  verdict the client produces; over an old client `last_search_verdict` would be
+  permanently `None` while the package advertised it. The floor also stops a
+  partial upgrade pairing this store with a client whose search shadow uses the
+  older stored rendering.
+- `__version__` in `__init__.py` was stale at `0.1.0` while the package shipped
+  as 0.1.1. It now tracks the pyproject version.
+
+### Added
+- **`SibylStore.last_search_verdict`** (branch `lang-core-verdict`,
+  2026-08-31). langgraph's `BaseStore.search` signature is fixed as
+  `list[SearchItem]`, so a zero cannot carry its own explanation through that
+  API. What this store can do is stop throwing the cause away: the canonical
+  verdict of the most recent query-backed search is exposed on the store, and an
+  empty FTS result is logged at DEBUG with its cause, so an operator debugging
+  "the store returns nothing" reads `empty_store` or `no_match` instead of
+  silence.
+- This package declares no cause vocabulary of its own — asserted by a test.
+
+### Unchanged
+- Row handling is untouched. `search_entities` now returns a `list` subclass, and
+  the store's slicing, filtering and comprehension over it behave identically.
+
+### Fixed (independent adversarial review, 2026-08-31)
+- **A zero-row page could ship with `verdict.code == "ok"`.** The verdict was
+  recorded from the raw FTS result, before the namespace-prefix filter, the value
+  filter and the offset/limit slice, so a page emptied by any of those three
+  reported `ok` and `explain(): "5 row(s) matched."` to a caller holding zero
+  rows — a confidently wrong explanation, which is worse than the silence this
+  contract replaces. Two further branches (`limit == 0`, and the non-query
+  listing path) never set the verdict at all and retained the previous call's.
+  It is now cleared first on every path and stamped after the final slice.
+
+## [0.1.1] - 2026-08-06
+
+### Changed
+- **Dependency floor raised to `sibyl-memory-client>=0.5.0`** for multi-language
+  search (schema v4). `SibylStore` search now resolves non-ASCII / non-Latin /
+  CJK / Thai / compound-token queries that previously returned nothing
+  (100-language sweep: 21/100 → 100/100). No `SibylStore` code change. See
+  `sibyl-memory-client` 0.5.0.
+- **Free-tier storage cap raised 2 MiB → 5 MiB (inherited).** The 0.5.0
+  folded-trigram search shadow roughly doubles on-disk footprint; the client's
+  default free cap (`FREE_TIER_CAP_BYTES`) was raised to 5 MiB (5,242,880 bytes)
+  to compensate, and `SibylStore(tier="free")` inherits it — no `SibylStore` code
+  change. `test_adv_fidelity.py::test_body_cap_boundary_no_truncation` (a ~1 MiB
+  value that occupies ~2.3 MB once the shadow mirrors it) now stores under the
+  5 MiB cap on its own merit rather than tripping `CapExceededError`; its cap
+  expectation was updated to the 5 MiB boundary. See `sibyl-memory-client` 0.5.0.
+
 ## [0.1.0] - 2026-07-05
 
 Initial release. `SibylStore`, a LangGraph `BaseStore` backed by Sibyl Memory's

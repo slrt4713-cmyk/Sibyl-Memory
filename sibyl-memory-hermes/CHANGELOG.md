@@ -4,6 +4,139 @@ All notable changes to `sibyl-memory-hermes` are recorded here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning
 follows [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- User-facing copy corrected from 2 MB to 5 MB to match the free-tier cap
+  raised in `sibyl-memory-client` 0.5.0. No behaviour change.
+
+## [0.4.0] "Lucid" - 2026-08-31
+
+Minor version: `search_multi_record` and `search` now return a `SearchResults`
+list subclass carrying `.verdict`, and the adapter's `sibyl_search` returns
+`{"results": [...], "verdict": {...}}` where it used to return `{"results": [...]}`.
+Every existing caller of the list is unaffected; a caller reading the adapter
+payload's keys should read this entry.
+
+- Floors `sibyl-memory-client>=0.8.0`. The provider forwards a verdict the client
+  produces; over an old client it would forward nothing.
+
+### Fixed (stage-3 ratification, 2026-08-31)
+
+- **The one-vocabulary guard did not read `adapter.py`.** The guard scanned
+  `provider.py` only, and `adapter.py` is the module that builds what a real
+  Hermes agent receives, so it is where a drifted second declaration of a cause
+  name matters most. A ratification pass planted `_LOCAL_CAUSE_COPY =
+  'abstained_on'` above `class SibylAdapter` and kept the suite green. The guard
+  now scans `adapter.py` with exactly the two teaching strings excised (the
+  `SEARCH_SCHEMA` description and the `system_prompt_block` return), located by
+  AST rather than by line range, so a rename of either surface fails the test
+  instead of silently widening the exemption. Re-attacked with the original plant
+  and four variants (both quote styles, a second key inside `SEARCH_SCHEMA`, a
+  gate-cause literal deep in a method body): all five now fail as they should. No
+  drifted copy existed; this closes the hole, it does not fix a live defect.
+
+### Added
+- **`search_multi_record` returns the cause by default** (branch
+  `lang-core-verdict`, 2026-08-31). The provider's own docstring already
+  DOCUMENTED this failure mode — "abstains ... the moment one significant query
+  token is content-shaped and has zero corpus support anywhere", citing the
+  Kravento PL eval — while offering only an opt-in `diagnostics=` dict to see it.
+  Documented-but-unreachable is what this closes: the return is now a
+  `verdicts.SearchResults` (a `list` subclass, so every existing caller is
+  unaffected) carrying `.verdict` with no kwarg to pass.
+- `search()` carries one too (`ok` / `no_match` / `empty_store` via one
+  zero-path probe), as the raw primitive.
+- **The Hermes adapter forwards it.** `sibyl_search` returns
+  `{"results": [...], "verdict": {...}}`, scrubbed like every other surfaced
+  value, and both the tool schema and the system-prompt block teach the
+  cause-scoped recovery so an agent knows what to do with an `abstained_on`.
+
+### Deprecated
+- `search_multi_record(..., diagnostics=<dict>)` — still populated identically,
+  plus an additive `verdict` key. Prefer `result.verdict`.
+
+### Unchanged
+- Both hermes provider paths are byte-identical to `ef98f5b` on every quality
+  field of the full 88-query battery, `hermes-agent==0.19.0`, adapter still bound
+  to the live ABC.
+
+### Fixed (independent adversarial review, 2026-08-31)
+- **`provider.search()` no longer calls `refine_zero`.** It looks like a
+  user-facing surface and is not: the adapter's `prefetch()` calls it once for
+  the whole query and then once per significant token, so the probe became a
+  per-token probe by another name — measured at 24 `COUNT(*)` on one turn against
+  an entities-empty store, where the pre-contract build took 0. It is the raw
+  primitive and reports `ok` / `no_match`; a surface that REPORTS the zero calls
+  `verdicts.refine_zero` itself, once.
+- The tool schema and system-prompt cause names are now asserted against the
+  `VerdictCode` values rather than exempted from the vocabulary scan.
+
+## [0.3.16] - 2026-08-22
+
+### Changed
+- **Dependency floor raised to `sibyl-memory-client>=0.7.0`, closing the same
+  packaging hazard fixed in `sibyl-memory-mcp` 0.1.14** (cryptoxdylan,
+  independent verification, 2026-08-18): the prior floor (`>=0.5.0`) meant a
+  Hermes-only `pip install -U sibyl-memory-hermes` could leave an older,
+  unpatched client in place. `provider.py`'s `search_multi_record` calls
+  `multi_record_search` directly, so Hermes agents were exposed to the same
+  default-path retrieval gaps as the MCP server. Picks up the client 0.7.0
+  N4/N5/N1'-diagnostics fixes.
+
+### Added
+- **`SibylMemoryProvider.search_multi_record` accepts an optional
+  `diagnostics: dict | None` kwarg**, passed straight through to the client's
+  `multi_record_search`. Populated with `abstained`, `abstained_on`,
+  `dropped_function`, `negation_dropped`, `coverage` — pass `diagnostics={}`
+  to see which token triggered an empty result instead of reading it as
+  "nothing was stored." Additive; every existing caller is unaffected.
+
+## [0.3.15-fixes] - 2026-08-16 (folded into 0.3.16, no separate release)
+
+### Fixed
+- **`sibyl_search` now answers question-shaped queries.** No adapter change — the
+  tool routes through the provider's `search_multi_record` → the client's
+  `multi_record_search`, which previously abstained (empty `results`) whenever a
+  query carried a zero-support *function* word (`kiedy`, `gdzie`, `when`, `who`,
+  `how`, ...). The client's N1 fix classifies zero-df tokens so function-shaped
+  ones are dropped while content-shaped absences (injection / `rejected` class)
+  still abstain. Requires `sibyl-memory-client` with the N1/N2/N3 recall fixes
+  (0.6.x follow-up to 0.6.0). New coverage:
+  `tests/test_sibyl_search_question_query_2026_08_16.py`.
+
+## [0.3.15] - 2026-08-06
+
+### Changed
+- **Dependency floor raised to `sibyl-memory-client>=0.5.0`** for multi-language
+  search (schema v4). The Hermes provider's `search_multi_record` path now
+  resolves non-ASCII / non-Latin / CJK / Thai / compound-token queries that
+  previously returned nothing (100-language sweep: 21/100 → 100/100). No adapter
+  code change. See `sibyl-memory-client` 0.5.0.
+
+## [0.3.14] - 2026-07-30
+
+### Added
+- **`SIBYL_TENANT_ID` env override in the Hermes adapter.** `initialize()` now
+  reads the non-secret `SIBYL_TENANT_ID` environment variable (stripped;
+  empty-or-absent means unset) and passes it as the explicit `tenant_id` to
+  `SibylMemoryProvider`. An explicit env tenant wins over anything in
+  `credentials.json`, matching the SDK provider's documented precedence
+  (explicit `tenant_id` > credentials(`tenant_id` > `account_id`) >
+  `DEFAULT_TENANT`). Absent or blank preserves current behavior exactly: the
+  provider still auto-loads `credentials.json` and resolves tenant as before.
+  `get_config_schema()` still returns `[]` (no double-prompt); the override is
+  an env var, not a Hermes setup field. The tenant value is never logged; the
+  init log records only whether an override was set.
+
+### Verified
+- **Runtime compatibility: hermes-agent 0.19.0** (current). The bundled adapter loads via
+  the live `agent.memory_provider.MemoryProvider` ABC (`_HERMES_AVAILABLE` true) and
+  instantiates cleanly (all four abstract methods implemented); the `SIBYL_TENANT_ID`
+  override is honored on `initialize()`. Three optional hooks added since v0.13
+  (`on_turn_start`, `on_session_end`, `backup_paths`) are not yet wired and inherit no-op
+  defaults (non-breaking; tracked as a follow-up).
+
 ## [0.3.13] - 2026-07-05
 
 Super-patch: recovery + adjudication of the remaining Fable 10-lens audit

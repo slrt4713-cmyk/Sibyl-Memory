@@ -4,6 +4,889 @@ All notable changes to `sibyl-memory-client` are recorded here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning
 follows [SemVer](https://semver.org/).
 
+## [0.8.0] "Lucid" - 2026-08-31
+
+The multilingual search stack was rebuilt: the query-time rescue layers that four
+evaluation cycles had accreted are gone, replaced by one versioned write-time
+normalizer, and every zero result now names its own cause. This is a minor-version
+release because the search shadow's stored rendering changed (every existing store
+re-backfills on first open) and because the response of every search entry point
+gained a carrier object.
+
+**Scope, stated plainly.** This release improves the INDEX layer, and that is
+where its measured wins are: inflected and non-spaced languages get word-boundary
+clean stored text, so a term can match at a word start instead of only as a free
+substring. It does NOT solve default-path natural-language recall. The first call
+on the default path still answers 32 of 155 natural paraphrases. What changed is
+that the other 123 now say why, and 99 of them are recoverable by a caller that
+reads the verdict and runs the taught two-retry loop. The 29 negation-phrased
+answerable questions still return nothing on the default path; they now report
+`negation_abstain` or `abstained_on`, and `NEGATION_POLICY` is unchanged. Nothing
+here should be read as a natural-language-recall fix.
+
+### Changed (SQLite floor: measured, and now enforced)
+
+The package carried two different SQLite floors, neither of them run: `shadow.py`
+documented 3.34 as the version where the FTS5 `trigram` tokenizer appears, and
+`storage.py`'s schema-failure recovery told the user to check for "3.38+ for
+json_valid". Meanwhile the stage-2 trigger rewrite, which stages the rendering
+through nested subqueries that read `new.` INSIDE a subquery, had only ever been
+executed on 3.45.1.
+
+- Verified against SQLite built from the amalgamation at **3.34.1** and **3.44.2**
+  (FTS5 + JSON1) and statically linked into a scratch interpreter. The trigger
+  shape parses and fires on all four tiers, the backfill path renders
+  byte-identically to the trigger path, and the shadow rows are byte-identical to
+  3.45.1's on the same DDL. The parser-ceiling constant `_STAGE_OPS` was tuned on
+  3.45.1 only; it is inside the ceiling on 3.34.1 and 3.44.2 as well.
+- One floor now, `shadow.SQLITE_MIN_VERSION = (3, 34, 0)`, and it is **enforced**:
+  `assert_sqlite_supported()` runs at the top of `Storage._ensure_schema`, before
+  the schema apply and therefore before any migration write, and raises
+  `SchemaError` naming the minimum, the found version and the reason. Below the
+  floor the old failure was "error in tokenizer constructor" from inside the v4
+  migration, which named neither. The second, contradictory "3.38+" claim is
+  deleted, and a test asserts no string in `storage.py` states a SQLite version.
+- `shadow.SQLITE_FULL_FOLD_VERSION = (3, 45, 0)` is a FEATURE boundary, not a
+  floor. Below 3.45 the shadow folds the non-decomposables in `FOLD_MAP`
+  (l-stroke, sharp s, o-slash, ae, d-stroke, dotless i, oe, thorn, eth) but not
+  decomposable diacritics, because that fold is the tokenizer's job and
+  `remove_diacritics` reached `trigram` in 3.45. So `Belzyce` does not find
+  `Bełżyce` on 3.34 through 3.44. The store opens, writes, migrates and searches;
+  the primary porter-unicode61 index is unaffected.
+- Measured on the suite, not asserted: 476 passed / 12 skipped on 3.34.1 and on
+  3.44.2, 477 passed / 11 skipped on 3.45.1. The single extra skip is the
+  `Belzyce` test, gated on the 3.45 boundary with the reason naming the version.
+  A companion test with only a non-decomposable fold runs on every version, so
+  the gate cannot become a place where the fold quietly stops being tested.
+
+### Determinism
+
+0.7.0, the released build, was **nondeterministic**: on the LongMemEval slice it
+reproduces 87 of 100 questions across passes. The causes were two ordering bugs,
+both fixed here.
+
+- The shadow's final tie-break was the row's business key, and a journal row's key
+  is a uuid4 minted at write time, so two tied journal rows swapped places between
+  runs of identical code on journal-heavy stores. The tie-break is now the row
+  text.
+- The relaxed ladder used `sorted(set(...), key=len, reverse=True)`, a stable sort
+  over a SET, so equal-length tokens came out in randomised string-hash order. The
+  key is now `(-len(t), t)`.
+
+This build reproduces 100 of 100, and the full battery is byte-identical across
+`PYTHONHASHSEED` 0, 1, 12345 and 98765 on rows and on verdicts.
+
+### Added
+
+**The cause-carrying verdict contract** (branch `lang-core-verdict`,
+2026-08-31). Four external evaluation cycles reduced to one defect: a zero result
+that cannot explain itself. `multi_record_search` could return `[]` for five
+structurally different reasons — an unsupported discriminating term, the negation
+policy, three separate scoring gates, an empty store, an honest miss — and all
+five reached the caller as the same four bytes.
+
+- **`verdicts.py`, the ONE canonical cause vocabulary.** A closed enum
+  (`VerdictCode`: `ok` / `abstained_on` / `negation_abstain` / `gated` /
+  `empty_store` / `no_match`), the three gate names (`GateCause`:
+  `coverage_floor` / `anchor_gate` / `prep_filter`), the `Verdict` envelope, and
+  a plain-language `explain()` generated from the enum. Every package in the
+  family imports these names; none re-declares one, and a contract test in each
+  package asserts it. Re-declaration is how a surface drifts from the engine and
+  starts reporting a cause the engine never emitted.
+- **`SearchResults`, a `list` subclass carrying `.verdict`.** The verdict is part
+  of the RETURN, not an optional kwarg, because the defect it closes was exactly
+  that the only explanation channel was opt-in — and the MCP server never opted
+  in. Every existing caller (`len`, iteration, indexing, `== []`, `json.dumps`,
+  `isinstance(x, list)`) is byte-for-byte unaffected.
+- **A single exit in `multi_record_search`.** Six `return` statements, all
+  through one internal `_finish` that stamps a verdict. A bare `return []` is now
+  a source-level contract violation, asserted by a test that reads the function's
+  own source. The three verify gates each count their drops (per-gate counters
+  plus the best coverage any candidate reached), so a `gated` zero can say which
+  gate emptied it and how close the best row came.
+- **`empty_store` is probed, never inferred** — a count across all four
+  searchable tiers, taken only on the zero path, once per zero. `entities` alone
+  would have lied about a store holding only journal or reference rows.
+  `refine_zero(client, results)` is the one-probe upgrade a user-facing surface
+  (CLI, MCP) applies to a bare `no_match`.
+- **All three SDK search entry points stamp a verdict**: `search()`,
+  `search_entities()` and `multi_record_search()`. The two primitives can only
+  report `ok` / `no_match` (they carry no abstention and no relevance gate), and
+  deliberately do NOT pay the empty-store probe — `multi_record` calls `search()`
+  once per query token, and a COUNT per token would be a real per-query cost for
+  an explanation only the outermost caller needs.
+
+### Deprecated
+
+- **`multi_record_search(..., diagnostics=<dict>)`.** Still populated, with
+  identical keys and values on every exit that previously wrote it, plus an
+  additive `verdict` key. It is also populated now on the three exits that
+  previously wrote nothing at all, which is the only observable difference from
+  the pre-contract build. Prefer `result.verdict`: an optional channel is one a
+  caller can forget, and forgetting it is the whole defect.
+
+### Unchanged (asserted, not assumed)
+
+No gate, threshold, lexicon, ordering or early-return condition was touched. The
+full multilingual battery (PL/EN at 300 and 1400 entities, UA/TR, the 155-query
+paraphrase set, and the hermes provider paths) is **byte-identical to `ef98f5b`
+on every quality field** — ordered row keys, recall, rank-1, noise counts and
+every aggregate. This stage adds explanation, not behaviour.
+
+Write-time normalization for the search shadow (branch `lang-core-normalize`,
+2026-08-30). One versioned normalizer, `shadow.NORMALIZER_VERSION = 1`, replaces
+the query-time rescue layers stripped below. It renders the stored text at WRITE
+time and the query at READ time from the same code.
+
+- **`normalize_py` / `normalize_select`** — the rendering: `fold` (unchanged)
+  plus boundary normalization, every punctuation and whitespace character
+  collapsed to a single space, plus one leading and one trailing pad. The stored
+  shadow text is now word-boundary clean, so a term can be matched at a WORD
+  START; previously a word inside a JSON body was usually preceded by `"` or `:`
+  and only a free-floating substring match was possible. Injected at the four
+  per-tier expressions `_entity_txt` / `_state_txt` / `_reference_txt` /
+  `_journal_txt`, shared verbatim by the triggers and the backfill, so both write
+  paths render byte-identically. The rendering is staged through nested
+  subqueries because SQLite's trigger parser overflows at about 27 nested
+  function calls and the chain needs 51.
+- **`normalize_token` / `normalize_terms`** — the ending rule, recovered from the
+  removed D2L block with its tuned parameters intact (min 5, drop 3, floor 5) and
+  two new guards: never truncate a token carrying a digit, and never truncate a
+  token from an unspaced script (Han, Kana, Hangul, Thai, Lao, Khmer, Myanmar,
+  Tibetan), which is what protects the CJK tail matching the shadow exists for.
+- **`shadow_search(..., normalize=True)`** — the normalized pass. One probe per
+  content term, always, in a fixed order, with no early stop and no selectivity
+  re-ordering; rows are then scored by `sum(len(term) / df(term))` over the terms
+  they cover, and the top-scoring rows are returned, ordered by whole-word
+  exactness, then word-start matches, then BM25. Terms the ending rule did not
+  shorten carry no score: that single rule, and no stoplist, is what stops 'and'
+  or 'gdzie' from scoring every row in the store.
+- **Twin masking closed** (2026-08-07 Finding 2). A single-token query whose
+  token the normalizer shortened consults the shadow even on a NON-empty strict
+  head, and appends. This is deliberately narrower than the 0.7.0 F2
+  unconditional append it replaces: it cannot fire on a multi-word query at all,
+  and it cannot fire on a token the ending rule leaves alone.
+- **Order change below an empty strict head.** The normalized shadow now runs
+  BEFORE the relaxed variants. Both are rescues, but the shadow answers the whole
+  query while the relaxed ladder's last resort answers one token of it. The
+  relaxed ladder still runs, unchanged, whenever the shadow has nothing.
+- **Two bug fixes found on the way.** A short non-ASCII token was a hard AND
+  requirement on every shadow candidate, so an accented 2-char Polish function
+  word ('są') silently zeroed the fallback; only unspaced scripts keep that
+  status now. And the journal cap `max(1, limit // 4)` was applied per pass, so
+  strict and shadow caps could stack; it is now enforced across the whole result.
+
+### Changed
+
+- `_SHADOW_MARKER` 4 -> 5. Marker 4 is the fold-only rendering, marker 5 is
+  NORMALIZER_VERSION 1; PRAGMA user_version is the on-disk stamp, so every
+  existing store drops, recreates and re-backfills its shadow on the next open.
+- `apply_shadow_migration` DROPs the ten maintenance triggers before recreating
+  them. `CREATE TRIGGER IF NOT EXISTS` alone would have left a pre-existing store
+  running the OLD rendering in its triggers while the backfill wrote the new one.
+- `normalize_terms` returns `(term, anchored, raw)` triples.
+
+### Measured effect
+
+Same battery, same 300-entity store, all figures from our own runs
+(`lang-core-rebuild/results/normalized.json`, three-way table in `delta3.txt`):
+
+- `client.search()`: Polish matched recall 16/16 (baseline 0.7.0 was 15/16,
+  stripped 8/16), Polish natural 19/19 (19/19, 11/19), Polish noise rows 17
+  (57, 25). English unchanged at 16/16 and 14/14 on every path.
+- Default path (`multi_record_search` and MCP): Polish matched recall 16/16
+  (15/16, 8/16), Polish natural 13/19 (13/19, 5/19), answerable Polish queries
+  returning nothing 6 (6, 20).
+- Injection battery zero rows on all three paths, no injection token with any
+  corpus support.
+- Storage: the normalized rendering REPLACES the folded one, no second copy. On
+  the 300-entity fixture the shadow text grows by 600 characters (the two pad
+  characters per row; the boundary substitution is 1:1 in length) and the DB
+  shrinks by 4096 bytes, one page, because punctuation trigrams give way to a
+  smaller space-trigram vocabulary. Entity writes cost about 20 percent more
+  (3.79 ms vs 3.12 ms per write) and a 300-row backfill 29.8 ms vs 16.0 ms.
+
+### Documentation (ratification pass 2026-08-31)
+
+Verdict PROMOTE. Two corrections; no behaviour change in this commit.
+
+- **Report corrections.** `46a3abf7` is 5 rows / 3 answer-bearing, not 10 / 3
+  (a transcription error against this repository's own recorded results). The two
+  residual LongMemEval suspects are reclassified from "clean non-losses" to real
+  losses: `e982271f` drops the session recording which venue was recommended LAST
+  and keeps only an interchangeable venue card that contains the gold string, and
+  `gpt4_f420262c` drops the EARLIEST session on an earliest-to-latest ordering
+  question. The stated root cause was also wrong for `e982271f`: raising the limit
+  to 11, 12, 13 or 15 does not recover its row, so an N2 holdback would not close
+  it and it needs a RANKING change, which is scoring work and is not excluded by
+  the constraint against head overrides. `gpt4_f420262c` does close at limit 11
+  via a holdback, which is excluded. Both are now recorded as known losses at
+  limit 10, clean at limit 25, deferred with reasons. The English noise accounting
+  gains the `N-en-11` line it previously omitted.
+- **OPEN, reported not decided: the append budget bounds only the coverage-1
+  class.** Rows covering two or more terms are unbounded, so boilerplate carrying
+  TWO of the query's terms produces 19 appended rows where 0.7.0 produces none. A
+  per-coverage-level budget was built and measured and is NOT shippable: it costs
+  35 answer-bearing rows across 7 LongMemEval questions. The distributions
+  overlap (a legitimate level needs 12 rows at 1 term, 9 at 2 and 7 at 4; the
+  sweep has 30 at 3), so no monotone query-shape budget separates them and a
+  tie-group bound fails identically. Behaviour is unchanged and pinned by
+  `test_corroborated_class_is_NOT_bounded_open_finding`. Contained meanwhile by
+  the preserved strict head, an untouched default path and the MCP byte budget.
+
+Gates re-run on the unchanged code: LongMemEval suspects 2, coverage 152 against a
+shipped envelope of 112 to 121, both recovered questions still recovered, 100 of
+100 deterministic. Battery PL 16/16 and 18/19, EN noise 20, injection 6 / 0,
+byte-identical across `PYTHONHASHSEED` 0/1/42/12345. Client suite 427 passed /
+11 skipped.
+
+### Changed (revision 5, LongMemEval retrieval parity 2026-08-31)
+
+A replayed-ingest retrieval diagnostic over the 100-question LongMemEval parity
+slice found this branch retrieving a strict SUBSET of released 0.7.0 on long
+natural-language English queries: 9 of 100 questions lost answer-bearing context
+and 2 lost it entirely. The cause was removing 0.7.0's F2 unconditional shadow
+append wholesale. F2's diseases came from the append being UNGUARDED, not from the
+append existing, so it is back with the guard in front of it.
+
+- **The non-empty-head append is no longer single-token.** It fires for any query
+  except a single token the ending rule left alone, always behind `decisive_only`.
+  The strict head keeps its rows and its order; only the tail grows.
+- **A relaxed head no longer blocks the append.** A stage-1 conjunction head used
+  to return outright; on the Downtown Farmers Market question that head is one raw
+  session and the row stating the figure was one guarded probe away.
+- **Eligibility is coverage COUNT; the idf score only orders.** Letting the score
+  filter collapsed a long question to one row: every candidate covered one of
+  three terms and a CO2 fertiliser row matching the rare `curren` outscored every
+  row matching `frien`.
+- **Weakly-corroborated rows are budgeted on the append paths.** Rows covering two
+  or more terms all stand; rows covering exactly one are admitted best-first up to
+  the query's content-term count. Refusing them loses the row that states the
+  answer; admitting them all appends nineteen stored notes to `complaint review
+  deadline`. The zero-hit path keeps its strict argmax.
+- **Determinism fix.** The shadow's final tie-break was the row's business key,
+  and a journal row's key is a uuid4 minted at write time, so two tied journal
+  rows swapped places between runs of identical code on journal-heavy stores. The
+  tie-break is now the row text.
+
+Measured. LongMemEval: changed-suspect questions 9 to 2, answer-bearing rows 107
+to 152 against shipped's 114 to 119, both total-loss questions recovering their
+gold rows, `L1` and the 1,573-entity recall sweep still identical, and 100 of 100
+questions deterministic across three passes (shipped 0.7.0 manages 87). The two
+remaining are cap-boundary effects at limit 10, clean at limit 25, neither a
+recall loss; closing them needs the N2 holdback, which is a head override.
+Battery: PL 16/16 matched and 18/19 natural unchanged, PL noise 33 to 42 against
+0.7.0's 57; EN 16/16 and 25/25 unchanged, EN noise 6 to 20 against 0.7.0's 46,
+every added row guarded; injection supported-class 6 on all three builds and 0 on
+the default path. Client suite 425 passed / 11 skipped.
+
+### Changed (revision 4, final re-verification 2026-08-30)
+
+Two changes, both in `client.py`, 31 insertions against 35 deletions.
+
+- **The saturation override is DELETED.** Two revisions carried an exception that
+  discarded a last-resort head which filled the caller's limit, and an
+  independent reviewer refuted both discriminators, each with a fresh case that
+  lost 20 correct rows: saturation alone lost `quarterly reconciliation`, and
+  saturation-plus-degraded lost `quarterly audits`. The ladder orders by raw
+  token LENGTH, a rarity proxy and not a relevance one, so degrading onto a
+  shorter token is no evidence that the token is wrong, and any third
+  discriminator built on the ladder's arrival path would share the defect.
+  Nothing overrides the head now: a saturated last-resort head is returned as-is,
+  which is 0.5.0 semantics. Accepted cost, one query shape: `termin rozpatrzenia
+  reklamacji` sweeps up the boilerplate phrase in every stored note and fills the
+  cap with it, matching `lang-core-strip`. Baseline 0.7.0 is one row better there
+  through the F2 append that stage 1 removed on purpose.
+- **The relaxed ladder's tie-break is deterministic.** `sorted(set(...),
+  key=len, reverse=True)` is a stable sort over a SET, so equal-length tokens
+  came out in randomised string-hash order; the key is now `(-len(t), t)`. This
+  was cosmetic while nothing read the order and became a non-deterministic ANSWER
+  once revision 3's override did. Verified across 12 random seeds and three full
+  battery runs at different `PYTHONHASHSEED` values, byte-identical on every row
+  set. `N-pl-13` improved as a side effect and now matches baseline.
+
+Battery, all three builds under `PYTHONHASHSEED=0`. `client.search()` Polish
+16/16 matched, 18/19 natural, 33 noise rows (baseline 15/16, 19/19, 57; stripped
+8/16, 10/19, 26); PL natural rank-1 16 against baseline 15. English unchanged at
+16/16 and 25/25. Default path completely unaffected by this revision: PL 16/16,
+13/19, six abstentions; EN noise 5, equal to stripped. Injection zero-support 0
+everywhere, supported-token 6 on all three builds and 0 on the default path.
+Client suite 418 passed / 11 skipped.
+
+### Changed (revision 2, after independent adversarial review 2026-08-30)
+
+The first cut of this work was reviewed independently and returned
+PROMOTE-WITH-FIXES with 2 blockers, both English regressions the battery could not
+see. Full disposition in `stage2-report.md` §10.
+
+- **The shadow no longer runs before the relaxed ladder.** Reverted to the 0.5.0
+  order. The ladder searches with FTS5 porter, which reaches `story` from
+  `stories`; the shadow only does substring on a fixed-length truncation, and
+  `stori` is not a substring of `story` but is one of `historic`. Running the
+  shadow first therefore answered with an unrelated row and LOST the correct one,
+  for -y/-ies plurals and for every digit-bearing identifier (never shortened, so
+  never a shadow content term, while CORE-11 exists to give it last-resort
+  recall). One narrow exception remains: a last-resort single-token head that
+  fills the caller's entire limit is overridden by the shadow, because filling the
+  cap from one token means that token matched indiscriminately. A last-resort head
+  that does NOT saturate keeps its rows and its rank 1, and the shadow's rows are
+  appended after it.
+- **The single-token consult requires the raw token.** `shadow_search` gained
+  `require_raw`, set only by the consult: an appended row must carry one of the
+  query's tokens verbatim, not merely its stem. Without it the consult fired on
+  most ordinary English nouns, because the ending rule truncates every 6-to-8
+  character token to five characters; `contract` reached control, contrast,
+  contribution, contrary and contralto, `df[contract]` went 1 to 7, and the
+  deflated idf pushed a correct row under `multi_record`'s coverage floor and off
+  the default path. `df[contract]` is now 2, equal to released 0.7.0.
+- **`shadow._heal` stamps the marker**, and the migration fast path additionally
+  samples one shadow row and requires the normalizer's pad. `_heal` is a second
+  writer of the rendering, so an old client healing a new store used to leave the
+  new marker standing over the old rendering, and the new client trusted its fast
+  path forever. The marker constant moved to `shadow.py`, next to the rendering it
+  stamps, and is now 6.
+- **The boundary set is complete.** 18 typographic characters were missing,
+  including the Polish quotation pair and NBSP, so a word wrapped in them had no
+  word start and the exactness tie-break scored 0 for it. `_BOUNDARY_CHARS` is now
+  49 entries, the chain 69 replacements, six staged subqueries.
+- **The re-backfill raises `busy_timeout` to 120 s for its duration.** The forced
+  re-migration is O(rows) under one write lock (measured elsewhere at 27 s for
+  100k rows) and a concurrent open died at the 5 s default above roughly 25k rows.
+  A mitigation, not a fix; it needs a release note.
+- Docstring and annotation corrections: `normalize_py` no longer claims
+  idempotence, `_content_terms` is annotated for the three-tuples it handles.
+
+Battery re-measured on all three builds after extending it with the three English
+shapes it was missing (-y/-ies plurals, identifier-plus-word, five-character
+prefix families) and two injection queries whose tokens have corpus support: 88
+queries, up from 75. `client.search()` Polish 16/16 matched and 19/19 natural with
+15 noise rows (baseline 15/16, 19/19, 55; stripped 8/16, 10/19, 26). English
+25/25 natural and 16/16 matched on every build; on the DEFAULT path English is
+byte-identical to the stripped build. Client suite 407 passed / 11 skipped.
+
+### Removed
+
+Query-time multilingual rescue layers stripped out of `MemoryClient.search()`
+(operator directive, branch `lang-core-strip`, 2026-08-30). Four external
+evaluation cycles accreted these layers at QUERY time, each compensating for the
+previous one's side effects. They are being removed so the replacement can be
+built at WRITE time on a clean base. This is a deliberate, measured recall
+regression in Polish, not a bug fix.
+
+- **F2 unconditional shadow append.** The folded-trigram shadow no longer runs on
+  every query with its hits appended after the head. It is once again a
+  ZERO-HIT-ONLY fallback, exactly as in 0.5.0: reached only when the strict pass
+  and every relaxed variant returned nothing. This restores the 0.5.0 behaviour
+  the 2026-08-07 report filed as Finding 2 (a weak English primary hit again
+  hides a same-fact row in another language).
+- **D2L coverage-gated stem rescue, and its probe ladder in full.** Deleted:
+  `_stem_token`, `_stem_truncated_query`, `_head_searchable_text`,
+  `_uncovered_stem_tokens`, and the constants `_STEM_MIN_TOKEN`, `_STEM_DROP`,
+  `_STEM_FLOOR`, `_GATE_ROW_BYTES`. Deleted from `search()`: the coverage gate,
+  the fully-stemmed probe, the selectivity-ordered probe loop (N3) and its
+  no-early-stop behaviour (N3').
+- **N2 relaxed-single holdback and backfill.** Existed only to reserve cap
+  headroom for the D2L rescue; with the rescue gone it has nothing to reserve for.
+
+`search()` is now exactly: strict head, relaxed variants on zero, zero-hit shadow
+fallback. Nothing else.
+
+### Kept (explicitly not part of this removal)
+
+- `shadow.py` in full: the trigram shadow table, its triggers, backfill and
+  diacritic folding (`fold_py`). This is the 0.5.0 foundation and the intended
+  delivery vehicle for the write-time replacement.
+- `multi_record.py` in full: the abstention side is unchanged — N4 any-df
+  function-word drop, N5 negation abstention, the `df == 0` content-shaped
+  abstention, the anchor/coverage gates, and the N1' diagnostics channel.
+- The MCP fence/scrub stack and every other search behaviour.
+
+### Measured effect
+
+In-house battery, 300-entity store, 32 matched PL/EN queries + 35 natural
+questions + 8 injection-shaped queries, all figures from our own runs
+(`lang-core-rebuild/results/`):
+
+- Polish `client.search()` matched recall 15/16 to 8/16; natural battery
+  19/19 to 11/19. English unchanged at 16/16 and 14/14 on every path.
+- The DEFAULT path moved just as far as the SDK path (PL matched recall
+  15/16 to 8/16, natural 13/19 to 5/19) even though none of its own layers were
+  touched. `multi_record_search` computes `df[t]` and gathers Stage-1 candidates
+  with `client.search(t)`, so removing the rescue drives PL tokens to `df == 0`,
+  where the kept content-shaped abstention zeroes the whole query.
+- Precision improved: English `client.search()` noise rows 39 to 0; Polish
+  57 to 25. One query ('aktualizacja cennika hurtowego') went from 20 rows with
+  19 noise rows to 0 rows, which is the N7 regression disappearing along with
+  the ladder that caused it.
+- The injection-shaped battery returns zero rows on all three paths before and
+  after, unchanged.
+
+### Tests
+
+Suites that pinned the removed semantics are SKIPPED with the reason
+`removed 2026-08-30 lang-core-strip (operator directive)`, not deleted, so the
+behaviour they asserted stays on the record:
+`test_covgate_stem_2026_08_12.py`, `test_probe_selectivity_2026_08_16.py` and
+`test_capfill_rescue_2026_08_16.py` at module level; two tests in
+`test_shadow_append_2026_08_12.py` individually. Client suite: 340 passed before,
+327 passed / 13 skipped after, zero failures. mcp, hermes and langgraph suites
+unchanged.
+
+### Fixed (independent adversarial review, 2026-08-31)
+- **`gated` could name a gate that did not fire.** The GATED decision keyed on
+  `scored[:limit]` rather than on `scored`, so with `limit <= 0` a candidate that
+  cleared every gate was removed by the SLICE and the verdict blamed a gate for
+  it. Unreachable through MCP (`safe_limit` clamps to >= 1); reachable from any
+  direct SDK call.
+- **The empty-store probe re-counted `entities`.** It is now short-circuited by
+  the `corpus_n` the function already takes for IDF weighting, so it costs
+  nothing on any store with entities and only walks the other three tiers when
+  `entities` is empty — the case where it is load-bearing.
+- **Two structural guards did not hold.** The single-exit test was defeated by
+  `return _finish(...) if False else []` and is now parsed rather than
+  string-matched; the one-vocabulary test missed single-quoted literals and now
+  derives its literal list from `VerdictCode` / `GateCause`; the gate-counter
+  test now pairs each `continue` with a `gates.record()` naming a DISTINCT gate
+  instead of counting both.
+
+## [0.7.0] - 2026-08-22
+
+Multi-language search, part 4 (Kravento / Bilbo Polish evaluation, closing out
+what 0.6.1 left open). Independent adversarial re-verification of the 0.6.1
+release (cryptoxdylan, external contributor) found the N-series only partly
+closed the default-MCP-path defect class: N2/N3 held, but a nonzero-df
+function word could still anchor/pollute scoring (N4), a dropped negation word
+silently answered the opposite of the query (N5, newly discovered), and the
+df=0 abstention rule itself remained unchanged with only its lexicon grown
+(N1'). This release closes N4 and N5, and ships a diagnostics channel for N1'
+after a coverage-ratio alternative was implemented and measured unsafe (see
+Fixed below). `search()` and `multi_record_search()` output shapes are
+backward-compatible except where a caller was relying on N5's prior (silently
+wrong) negation behavior — see Changed. New optional `diagnostics` kwarg on
+`multi_record_search` is additive; every existing caller is unaffected.
+
+### Fixed
+
+- **N4 — a nonzero-df function word could anchor the ranking and crowd out the
+  genuine match.** N1 (0.6.1) dropped a function-shaped token only when it had
+  zero corpus support. A function word that happened to have SOME support
+  elsewhere by pure substring (`'our'` matching inside `'c-our-ier'`) was kept,
+  and because it was rare (low df) it could become the anchor term and sit in
+  the idf denominator, scoring a spurious match (`courier-pickups`) higher than
+  the genuine one (`warehouse-*`, matching `'warehouses'`) — measured missing
+  `COVERAGE_THRESHOLD` by 0.005 in the reported case. A function-shaped token
+  is now dropped at ANY df, not only df==0, provided at least one content
+  token survives (an all-function query is left untouched, byte-identical to
+  0.6.1). `'where are our warehouses'`: 1 wrong result → 3 correct results.
+- **N3' — the D2L rescue ladder still stopped at the first appending probe
+  when it shouldn't have.** N3 (0.6.1) ordered probes by selectivity but kept
+  the original "stop after the first append" discipline. For a query naming
+  TWO concepts that both have answers (`'reklamacji magazynie'`), stopping
+  after the first discarded a row that had already been fetched and paid for.
+  The ladder now continues while `len(out) < cap` instead of breaking at the
+  first append; fan-out is unchanged (all probes are fetched up front).
+- **Coverage computation no longer assumes every matched token survived the
+  drop step.** `cov = sum(idf.get(t, 0.0) for t in e["m"]) / total` — a
+  candidate that matched ONLY a since-dropped function/negation token now
+  scores 0 coverage instead of raising `KeyError` or (pre-fix) riding that
+  token's idf into relevance.
+
+### Added
+
+- **N5 — negation-word policy.** Dropping a negation word (`'not'`, `'nie'`,
+  `'nicht'`/`'kein'`...) as a function word left the query answered as if it
+  were never negated (`'contract not approved'` → the record saying it WAS
+  approved). Full-text search has no negation handling either way, so this is
+  a policy decision, not a quality regression: `NEGATION_POLICY` (module
+  constant, default `"abstain"`) makes a dropped negation word abstain the
+  query (`[]`) instead of silently answering the opposite. `"ignore"`
+  preserves the pre-N5 behavior as an explicit opt-out. Verified against the
+  full suite with zero regressions.
+- **N1' diagnostics channel.** A coverage-ratio alternative to the df==0
+  abstention rule ("abstain only when supported-token coverage falls below a
+  fraction of the query") was implemented and measured, then rejected on
+  evidence: the paraphrase class and the abstention class collide at
+  identical coverage ratios with opposite required outcomes (e.g. 0.667 for
+  both an answerable multi-word question and an unanswerable
+  short-discriminator query) — `df` cannot distinguish an unsupported
+  CONNECTIVE VERB from an unsupported DISCRIMINATOR without a signal this
+  module does not have (morphology/POS). `DF0_ABSTAIN_POLICY` is recorded as
+  a documented sentinel (`"any"`, the only supported value) rather than
+  shipped as a second, unsafe code path. What ships instead: an optional
+  `diagnostics: dict | None` kwarg on `multi_record_search`, populated with
+  `abstained`, `abstained_on`, `dropped_function`, `negation_dropped`, and
+  `coverage` — additive, zero extra searches, zero precision cost. `count: 0`
+  stops being indistinguishable from "nothing is stored"; a caller reading
+  `abstained_on` can retry `tiers="entity"` with the one word to drop instead.
+
+### Changed
+
+- Default runtime behavior for a query containing a negation word that gets
+  dropped as a function word: previously answered with the record asserting
+  the opposite (silently wrong); now abstains (`[]`) unless `NEGATION_POLICY`
+  is explicitly set to `"ignore"`. This is the one behavior change in this
+  release that isn't purely additive — flagged here per SemVer minor
+  (real query results can change for negated inputs, everything else is
+  either a precision improvement or additive).
+
+### Provenance
+
+cryptoxdylan (external contributor) independently reproduced both the
+2026-08-07 and 2026-08-13 Kravento/Bilbo reports as pytest regression suites
+against clean PyPI installs, confirmed F1/F2/F3/N2/N3 closed, and reproduced
+N4/N1'/N3'/N5 live on 0.6.1 (black-box, freshly-spawned MCP process included).
+He also flagged a packaging hazard closed in this release cycle (see mcp/
+hermes CHANGELOGs): `sibyl-memory-mcp` and `sibyl-memory-hermes` floored on
+`sibyl-memory-client>=0.5.0`, so an MCP- or Hermes-only `pip install -U` was a
+silent no-op once `sibyl-memory-cli`'s tighter floor was the only thing
+actually pulling a newer client. He built and emailed a working patch with a
+339/343-passing test run; that attachment did not survive the Gmail-attachment
+retrieval path intact (gzip CRC mismatch, confirmed corrupt against two
+independent decode paths in the same session this shipped). The fix above is
+SIBYL's independent reimplementation against his detailed written analysis,
+verified against the scenarios he reproduced rather than his exact bytes.
+
+## [0.6.1] - 2026-08-16
+
+Multi-language search, part 3 (Kravento / Bilbo Polish evaluation, follow-up to
+0.6.0). Three targeted recall fixes on the retrieve-then-verify + rescue path.
+`search()` and `multi_record_search()` output shapes are unchanged and every
+change is strictly append-only / additive-at-cap, so this stays a
+backward-compatible release: no migration, no downstream (`mcp`/`hermes`/
+`langgraph`/`cli`) code change required. Regression gate held: existing client
+suite green; the SDK `client.search()` PL/EN twin battery stays **PL 16/16,
+EN 16/16** at 32 / 300 / 3000 entities. The headline of this release is that the
+agent-**default** MCP path (`memory_search` with `tiers` omitted →
+`multi_record_search`) now reaches that same parity on natural question-shaped
+queries: a faithful default-path battery (16 parallel PL + 16 EN facts, Polish
+stored inflected and queried in a DIFFERENT inflection) moved **PL 9/16 → 16/16
+and EN 15/16 → 16/16** — every prior miss was a zero-df function word the lexicon
+did not recognise (N1 / Finding B), not a content-shaped abstention.
+
+### Fixed
+
+- **N1 — question-shaped queries abstained on the default (multi-record) path.**
+  `multi_record_search` abstains (`return []`) the moment any significant term has
+  zero corpus support, so a discriminating absence (`rejected`, an injection
+  token) correctly collapses the query. But the module stoplist `_STOP` was 23
+  English words with **no interrogatives**, so a zero-support *function* word
+  (`kiedy`, `gdzie`, `jest`, `when`, `who`, `how`) survived tokenization and
+  collapsed the *whole* query — the agent-default MCP path (`memory_search` with
+  `tiers` omitted) and the Hermes `sibyl_search` rail both returned nothing for a
+  natural question. The df=0 gate now classifies the zero-df token against a
+  **curated function-word lexicon ONLY** (`_DF0_FUNCTION`: EN interrogatives /
+  auxiliaries / modals / pronouns + declined PL copula/pronoun paradigms with
+  their ASCII de-diacritic twins + compact DE/FR/ES/CZ sets): a listed
+  **function-shaped** token is **dropped** (it carried no corpus signal by
+  construction), while **anything not in the lexicon** (a content word of any
+  length, a ticker / codename / brand code, a digit-bearing identifier, any
+  non-ASCII content token) still **hard-abstains**. The drop happens before
+  idf / min_df / anchor computation, so the coverage denominator excludes the
+  dropped token (`kiedy jest inwentaryzacja` scores coverage 1.0 on
+  `inwentaryzacja`) and the injection / `rejected` abstention contract is intact
+  (`co0001 nonexistenttokenzzzq report` still returns `[]`).
+
+  **Finding B (adversarial-panel expansion).** The first cut of `_DF0_FUNCTION`
+  carried only a compact interrogative/copula set, so natural PL/other-language
+  questions still zeroed on the default path when they used an inflected function
+  form the lexicon missed (the fusional być paradigm is the worst offender:
+  a future/present/past *person* the store never carries — `będą`, `jesteśmy`,
+  `będę` — collapsed the whole query). The lexicon is now widened to the
+  high-frequency function inventory: the **full być paradigm** (present / future /
+  past / conditional, incl. ASCII de-diacritic twins), the **completed
+  interrogative/relative family** (`kim`, `czym`, `jacy`, `skąd`, `dokąd`, the
+  declined `który`/`jaki`/`czyj` forms), common **PL prepositions, conjunctions,
+  particles, and pronouns/possessives**, plus the obvious missing high-frequency
+  **EN / DE / FR / ES / CZ** function words. HARD RULE held throughout — every
+  entry is a genuine function word safe to drop when absent; known content
+  collisions were deliberately excluded (`bez`=lilac, `ten`/`nas`/`nią`, the
+  number words `one`/`ten`, `mine`/`can`/`may`, DE `die`/`war`/`man`/`hat`, FR
+  `car`/`par`/`son`/`ton`, ES `son`/`con`/`sin`/`era`, CZ `byt`). Faithful
+  default-path battery (16 PL + 16 EN, question-shaped, tiers-omitted):
+  **PL 9/16 → 16/16, EN 15/16 → 16/16**; SDK `client.search()` unchanged at
+  **16/16 / 16/16**.
+
+  Classification is **lexicon-only, by deliberate design.** An interim revision
+  additionally dropped any `<=4`-char ASCII-alpha zero-df token; that length net
+  was reverted before release because length is not a function-vs-content signal.
+  It swept in exactly the short discriminators an entity/company store is queried
+  by (`acme`, `acer`, `weth`, `usdc`, `aero`, `visa`, `ford`, `meta`, `ikea`,
+  `sol`, 3-4-letter names) and, for an *absent* such term, dropped-then-collapsed
+  the query into a cross-entity firehose (`acme report` returned 10 unrelated
+  reports) instead of abstaining; it also let arbitrary short garbage tokens
+  `continue` past the df=0 early-abort, reopening the CORE-6/MH-3 per-token fanout
+  bound (`return []` on the first content-shaped absence is restored, so a 24
+  short-garbage-token query issues one `client.search()`, not 24). The safe
+  direction is preserved: an **unlisted** function word (any language, any length)
+  falls through to hard-abstain — over-abstain, never over-recall. **Known limit:**
+  because the classifier is a curated lexicon and Polish/German are fusional, this
+  is an ongoing lexical-coverage burden, not a solved problem — inflected forms
+  outside the lexicon (rare oblique cases, tense/person conjugations) still
+  collapse a question to `[]`; widen `_DF0_FUNCTION` to cover them as they surface.
+- **N2 — a cap-filling relaxed single-token head suppressed the F2/D2L rescue.**
+  When strict AND missed and the relaxed *single-token* last resort filled the cap
+  with rows sharing one common token, the `if len(out) < cap` guard skipped both
+  the F2 shadow and the D2L stem rescue, and an inflected target that lost the
+  FTS-rank lottery for a head slot never surfaced (19 junk rows FOUND the target,
+  20 junk rows LOST it — exactly cap arithmetic at limit=20). `search()` now holds
+  back a small tail reserve (`max(1, cap//4)`) of the relaxed single-token head so
+  the rescue stages run, then **backfills** the held rows after the rescue: when
+  the ladder rescues nothing the output is byte-identical to before; when it
+  rescues K rows the result is truncated-head + K rescue rows + backfilled held
+  rows, still exactly `cap`, still dedup-safe. **Strict-head invariant preserved:**
+  the holdback can only fire when `_search_strict` returned `[]` (the sole path
+  into the relaxed loop), so a non-empty strict head is never trimmed or
+  reordered.
+- **N3 — the stem-rescue ladder probed by length, not selectivity.** The D2L
+  ladder ordered uncovered stems longest-first and stopped at the first that
+  appended, so a saturated high-frequency stem (`aktualiza`, 20 rows) beat a
+  discriminating one (`cenni`, 1 row incl. the target) purely because it was
+  longer — the target was never probed. The ladder now pre-fetches the uncovered
+  stems and orders them by **measured selectivity** (fewest hits = most
+  discriminating), with stem length as the tie-break, then stops at the first
+  probe that appends. The pinned stop-at-first-append discipline and length
+  tie-break output on ties are unchanged
+  (`test_covgate_stem::test_ladder_longest_first_and_stops` green verbatim); only
+  *which* probe wins when hit counts differ.
+
+  **Panel Finding A (regression fix, must-not-ship).** An interim cut bounded the
+  fetch by slicing the probe SELECTION to the `_STEM_PROBE_MAX=8` **longest**
+  uncovered stems before measuring selectivity. That truncated the candidate set:
+  a query with >8 uncovered stems whose only reachable target sits on a stem past
+  position 8 (in longest-first order) never probed it — a recall regression versus
+  0.6.0, which probed **every** uncovered stem. The slice (and the constant) were
+  removed: the ladder now fetches **all** uncovered stems, so no reachable target
+  is dropped, and orders them by selectivity as above. Fan-out is bounded exactly
+  as in 0.6.0 — by the uncovered-stem count, which equals the query's match-token
+  count — with no NEW cost exposure: the default MCP path reaches `search()` with
+  single-token queries (≤1 uncovered stem each), and `multi_record_search` bounds
+  its own caller upstream via `_MAX_FANOUT_TOKENS`. Guarded by
+  `test_probe_selectivity::test_no_truncation_beyond_probe_cap` (a 9-uncovered-stem
+  query whose most-selective probe is the shortest stem — dropped by the old
+  `[:8]` slice, surfaced by the fix).
+
+## [0.6.0] - 2026-08-12
+
+Multi-language search, part 2 (Kravento / Bilbo Polish evaluation). On the same
+corpus, code, and store the Polish recall was 81% against English 100% — a gap
+that is entirely linguistic, not a bug. Two search-path changes (F2 + D2L) close
+it. Official harness (32-query PL/EN twin battery, LIMIT 10): **Polish recall
+8/16 → 16/16, English recall stays 16/16**; a 6-query realistic PL multi-token
+extension battery goes **4/6 → 6/6**. `search()` output shape is unchanged and
+every change is strictly append-only, so this is a backward-compatible minor
+release: no migration, no downstream (`mcp`/`hermes`/`langgraph`/`cli`) code
+change required.
+
+Also aligns stale `2 MB` free-tier-cap references (comments, docstrings,
+README) to the current `5 MB` cap (raised in 0.5.0); no behavior change.
+
+### Fixed
+
+- **F2 — the folded-trigram shadow was suppressed by any non-empty primary hit.**
+  `search()` fired the v0.5.0 shadow only on a total zero-hit (`if not hits:`),
+  so a single weak/English strict hit hid same-fact rows in other languages —
+  e.g. `search("packshot")` returned the English `packshots` row and skipped the
+  Polish `packshoty` row; the failure worsens as the store fills. The shadow now
+  runs **unconditionally** and its hits are **appended** after the primary
+  (strict/relaxed) hits, deduped on the `(tier, category, key)` identity triple
+  and capped at `limit`. **Append-only invariant:** the primary head is never
+  reordered or dropped — the shadow can only extend the tail — so English recall
+  and existing ranking cannot regress. (harness: Polish recall 8 → 9/16 from F2
+  alone; the packshot class is fixed.)
+
+### Added
+
+- **D2L — coverage-gated stem rescue with a rescue ladder.** Fusional languages
+  inflect by REPLACING endings (`reklamacj-a/-e/-i` share the stem `reklamac`),
+  so porter token-equality (strict) and the trigram substring test (raw shadow)
+  BOTH fail for an inflected query. D2L turns ending-replacement into the
+  substring problem the shadow already solves, appended after the F2 head:
+  - **Coverage gate.** Only query tokens whose stem is *not* already
+    substring-covered by the assembled head trigger stem work. A query porter or
+    the raw shadow already answered runs no stem probe at all — this is what
+    keeps the pass off the English path at scale (stem probes measured 32/32 →
+    7/32 per query battery-wide).
+  - **Rescue ladder.** When some token is uncovered, the fully-stemmed query
+    (all tokens stemmed, AND-ed) is tried first; if it appends nothing the
+    uncovered stems are probed as single tokens, **longest-first, stopping at the
+    first that appends**. This rescues realistic multi-token PL queries whose
+    full-stemmed AND matches nothing (e.g. `status reklamacji` → the
+    `reklamacja` row), the class an unconditional single stem pass hard-misses.
+  - **Parameters:** `_STEM_MIN_TOKEN=5`, `_STEM_DROP=3`, `_STEM_FLOOR=5`, digit
+    tokens exempt (`q3`/`v2`/`k8` stay exact). Crude fixed-length truncation is
+    deliberate — there is no Polish stemmer in the stdlib, and *because* it is
+    crude it survives stem-internal palatalization a rule-based stemmer would
+    diverge on (`wysyłka`/`wysyłce` both keep the `wysył` prefix). `drop=3`
+    covers the 2–3 char ending classes of Polish/Czech/Russian declension
+    (`drop=2` misses `-ach` locatives such as `magazynach`); `floor=5` keeps
+    stems long enough to avoid cross-lemma collisions at scale.
+  - Applied ONLY in the append-only rescue path of `search()`, gated on
+    coverage — never on the strict path — so the primary index and its ranking
+    are untouched, and every probe goes through `_shadow_fallback` (errors
+    contained to `[]`).
+
+  **Measured trade-off (official 32-query battery vs F2-only):** mean precision
+  0.980 → **0.9479**, precision@1 0.960 → **0.9688** (up), fp_total 1 → **4**.
+  The two coverage-gated FPs D2L removes relative to an unconditional stem pass
+  are exactly the avoidable class (same-stem noise appended to a query the head
+  already answered). **Two documented residuals:**
+  1. Shadow/stem appends are skipped once the head fills to `limit`, so the
+     old zero-hit-suppression shape reappears exactly at limit-saturation —
+     inherent to append-only + cap.
+  2. Same-stem SIBLING rows are not appended when the queried concept already
+     surfaced in the head (the coverage gate suppresses them). This is
+     consistent with the battery's own false-positive convention (the same
+     sibling-append event is scored as noise elsewhere in the battery); full
+     sibling-vs-noise separation is semantic and requires F3.
+
+### Roadmap (not in this release)
+
+- **F3 — substring/trigram is structurally mismatched with fusional morphology.**
+  Polish query-is-substring-of-stored held 0/7 vs English 7/7. The true fix is
+  language-aware **lemmatization at index time** (a pluggable per-language
+  analyzer writing lemmas into the shadow) plus relevance scoring to separate
+  same-lemma siblings from same-stem noise. Out of scope here.
+
+## [0.5.0] - 2026-08-06
+
+Multi-language search. The default (linker) search path was effectively
+Latin-ASCII-only: a 100-language write+query sweep passed **21/100**. This
+release takes it to **100/100** (measured; deterministic dataset — one
+native-script write+query probe per language). Absorbs PR #25 (0.4.20).
+
+### Fixed
+
+- **Non-ASCII and non-Latin queries silently returned zero results on the
+  default (untiered) search path.** Reported via Discord as "Polish diacritics
+  break full-text search" (`search("Bełżyce")` → 0 hits). The fault was never
+  FTS5 (`porter unicode61` folds decomposable diacritics correctly and a direct
+  `entities_fts MATCH` returns the rows); it was the query-side linker plus an
+  index that cannot see inside an unbroken token. Five distinct mechanisms:
+  - **M1 — ASCII-only linker regex.** `_significant_tokens` tokenized with
+    `[A-Za-z0-9]+`, shattering any non-ASCII word into index-absent fragments
+    (`Bełżyce → ['yce']`) or none at all (Cyrillic/CJK/Greek/Arabic → `[]`), and
+    the linker abstains as soon as one token has df=0. (This is PR #25's fix.)
+  - **M2 — ASCII-calibrated length filter.** The `len(t) > 2` floor dropped
+    2-char CJK/Hangul words (the norm in those scripts) and Brahmic combining-mark
+    fragments, emptying the token list → unconditional abstain. Now applied to the
+    ASCII path ONLY; short non-ASCII tokens are kept.
+  - **M3 — lowercase-before-split.** `query.lower()` ran before tokenization, and
+    `'İstanbul'.lower()` emits `i` + combining U+0307, which then split. Now we
+    split first and case-fold per token only when the fold is length-preserving.
+  - **M4 — glued/single-token runs (index side).** `unicode61` indexes an
+    unbroken letter run as ONE token, so `MATCH '北京'` never hits `北京烤鸭`; same
+    shape for Thai fragment glue and Zulu/Bantu locative compounds. No query-side
+    fix can reach inside a token — this needs substring matching.
+  - **M5 — non-decomposable fold gap.** `ł ß ø æ đ ı œ þ ð` have no canonical
+    decomposition, so no `remove_diacritics` setting folds them; `Belzyce` cannot
+    find a stored `Bełżyce` without an explicit fold map on both sides.
+
+  Staged, measured recovery on the 100-language harness:
+  **21 (baseline) → 69 (PR #25 `\w+`) → 87 (script-aware linker, M1+M2+M3) →
+  100 (folded-trigram shadow, M4+M5).**
+
+### Added
+
+- **Script-aware `multi_record._significant_tokens` (M1+M2+M3).** Splits before
+  case-folding, keeps short non-ASCII tokens, and preserves **byte-identical
+  ASCII behaviour** (the pre-0.5.0 stopword + `len>2` + lower token stream is
+  unchanged). Supersedes PR #25's one-line `\w+` change.
+- **Folded-trigram search shadow (`shadow.py`, schema v4; M4+M5).** A single
+  standalone FTS5 `trigram` table (`search_shadow`) holding a FOLDED rendering of
+  all searchable text across the four tiers (entity/state/reference/journal),
+  maintained by DB-side triggers, consulted ONLY as a **zero-hit fallback** in
+  `MemoryClient.search()`. Gives substring semantics (matches inside CJK/Thai/
+  Bantu/compound tokens — and partial-word/typo'd-suffix queries in any language
+  as a free side effect) plus an explicit fold map that closes the
+  non-decomposable class in both directions (`Belzyce` ↔ `Bełżyce`).
+  - **Strictly additive → benchmark-safe by construction.** The fallback fires
+    only where today's answer is `[]`; a non-empty strict result is returned
+    untouched, so ranking/recall of existing hits (English recall, LongMemEval)
+    cannot regress. `prefix=True` searches are unaffected.
+  - **No native dependency.** `trigram` is built into SQLite; the shadow keeps the
+    plugin shipping pure-Python wheels. `remove_diacritics 1` is used on SQLite
+    ≥ 3.45 and a bare `trigram` below it (runtime-selected; a DB moved across that
+    boundary self-heals).
+  - **Correct under old clients.** The triggers are DB-resident SQL, so a 0.4.x
+    client writing to a migrated DB keeps the shadow in sync without knowing it
+    exists; old clients simply never query it.
+
+### Changed
+
+- **Schema v3 → v4 migration** (`storage.py`): creates `search_shadow` + its
+  triggers and backfills all four tiers, stamped in `PRAGMA user_version`
+  (`_SHADOW_MARKER = 4`) by the same crash-atomic machinery as the FTS-rebuild
+  marker — a crash anywhere rolls the whole transaction back and the next open
+  retries. The fast path returns only when the shape is v3, the marker is ≥ 4,
+  the shadow table is present, **and all 10 shadow triggers exist** (F1), so a
+  dropped/corrupt shadow — including an out-of-band drop of a single maintenance
+  trigger — is rebuilt on the next open. The shadow is derived state: base-table
+  data is never touched and it is always rebuildable.
+- PR #25's pinned `xfail` (`Belzyce` → `Bełżyce`) now passes as a normal test
+  (its `strict=True` marker is removed).
+
+### Hardening (post-review, 2026-08-06)
+
+- **F1 — migration fast path requires the full trigger set, not just the table.**
+  The v4 fast-path precondition previously checked only that the `search_shadow`
+  TABLE existed. An out-of-band drop of any of the 10 maintenance triggers left
+  the table present but silently un-maintained (writes stopped propagating to the
+  shadow), risking a stale/false-positive fallback hit. The fast path now also
+  requires the shadow trigger count to be exactly 10 (cheap `sqlite_master`
+  lookup, `shadow.shadow_triggers_complete`); on mismatch it falls through to the
+  idempotent `apply_shadow_migration`, which recreates every trigger and
+  re-backfills — mirroring how the v3 FTS triggers self-heal on each open.
+  Regression test drops one trigger out-of-band and asserts the count returns to
+  10 and the shadow is consistent again.
+- **F3 — one undecodable row no longer voids the fallback.** In
+  `shadow.shadow_search`, the per-row `_shape_hit` join back to the base table is
+  now wrapped so a single row with an undecodable JSON body (corrupt row, partial
+  write, manual edit) is SKIPPED rather than raising out of the whole fallback and
+  losing every other valid hit — consistent with the §4.2 "a broken shadow must
+  never take down search" containment stance.
+
+### Rollback
+
+The shadow is additive and reversible. To restore exact v3 behaviour (base data
+is never affected):
+
+```sql
+DROP TRIGGER IF EXISTS entities_ai_shadow;
+DROP TRIGGER IF EXISTS entities_au_shadow;
+DROP TRIGGER IF EXISTS entities_ad_shadow;
+DROP TRIGGER IF EXISTS state_documents_ai_shadow;
+DROP TRIGGER IF EXISTS state_documents_au_shadow;
+DROP TRIGGER IF EXISTS state_documents_ad_shadow;
+DROP TRIGGER IF EXISTS reference_documents_ai_shadow;
+DROP TRIGGER IF EXISTS reference_documents_au_shadow;
+DROP TRIGGER IF EXISTS reference_documents_ad_shadow;
+DROP TRIGGER IF EXISTS journal_events_ai_shadow;
+DROP TABLE IF EXISTS search_shadow;
+PRAGMA user_version = 3;
+```
+
+### Notes / scope
+
+- **Free-tier cap raised 2 MiB → 5 MiB (operator directive, spec §6):** the
+  folded copy + trigram index roughly **doubles** the on-disk footprint (measured
+  ~2.27× on an English-heavy corpus), which would have made free users reach the
+  old 2 MiB cap roughly 2× sooner. Rather than ship that regression, the default
+  free storage cap is raised to **5 MiB (5,242,880 bytes = `5 * 1024 * 1024`)** so
+  a free user keeps roughly the same effective headroom they had before the shadow
+  existed. The client constants `_capcheck.FREE_TIER_CAP_BYTES` and
+  `lint.DEFAULT_SOFT_CAP_BYTES` / `TIER_SOFT_CAPS["free"]` now default to 5 MiB,
+  and the user-facing cap messages say "5 MB". **Deploy-time parity (outside this
+  repo):** the server `pricing.js` default `cap_free_bytes` and the server
+  `sibyl_plugin.config.cap_free_bytes` must also be set to `5242880` so the SDK
+  and server agree on the cap.
+- **Honest scope of 100/100:** one native-script write+query probe per language.
+  It does NOT claim full linguistic quality — no CJK/Thai word segmentation
+  (substring, not semantic), no cross-script/romanization (`Beijing` will not find
+  `北京`), no non-English stemming. Those remain for a future ICU/embedding tier.
+- Impact on existing queries is nil by construction: English/ASCII queries take
+  the identical pre-0.5.0 path and the fallback is never reached when the primary
+  index returns anything.
+
 ## [0.4.19] - 2026-07-05
 
 Super-patch: recovery + adjudication of the remaining Fable 10-lens audit

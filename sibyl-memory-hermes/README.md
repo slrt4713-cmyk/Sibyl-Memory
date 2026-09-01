@@ -31,7 +31,7 @@ Restart Hermes. Four tools become available to the agent:
 - `sibyl_search(query)`. FTS5 search across **all four tiers** (entities, state, journal, reference); hits are tier-tagged
 - `sibyl_list(category?, status?)`: browse what's remembered
 
-Optional: lift the 2 MB free-tier cap by binding your account:
+Optional: lift the 5 MB free-tier cap by binding your account:
 
 ```bash
 pip install sibyl-memory-cli
@@ -53,6 +53,14 @@ provider.save_context(
 )
 provider.search("v0.3.1")                # FTS5 across entities + state + reference + journal
 ```
+
+## Environment overrides
+
+| Var | Default | What it does |
+|-----|---------|--------------|
+| `SIBYL_TENANT_ID` | unset | Non-secret tenant override. When set to a non-empty value it becomes the active tenant and wins over the tenant in `credentials.json`. Blank or unset leaves tenant resolution untouched. This is an identifier, not a secret. |
+
+Precedence: explicit `SIBYL_TENANT_ID` > `credentials.json` (`tenant_id` then `account_id`) > the shared default tenant. Set it when one machine or container needs to target a specific tenant without editing the credential file.
 
 ## Why "local-first"?
 
@@ -82,7 +90,7 @@ Different intents, different lookups, no embedding model required. FTS5 covers f
 
 ## Hermes contract
 
-The Hermes plugin is implemented by a bundled adapter at `_hermes_plugin/adapter.py`. The adapter is copied into `$HERMES_HOME/plugins/sibyl/` by the `install-plugin` console script and is what Hermes' filesystem loader picks up. The adapter implements Hermes v0.13's `MemoryProvider` ABC and delegates every call to `SibylMemoryProvider`.
+The Hermes plugin is implemented by a bundled adapter at `_hermes_plugin/adapter.py`. The adapter is copied into `$HERMES_HOME/plugins/sibyl/` by the `install-plugin` console script and is what Hermes' filesystem loader picks up. The adapter implements Hermes v0.13's `MemoryProvider` ABC and delegates every call to `SibylMemoryProvider`. Verified against `hermes-agent` through **0.19.0** (current): the adapter loads via the live ABC and instantiates cleanly.
 
 The SDK class itself (`SibylMemoryProvider`) is framework-agnostic: it does not inherit from any framework ABC. This is the v0.3.0 architecture shift. v0.2.x and earlier attempted soft-inheritance via a broken import path; that path was removed and the adapter pattern replaced it.
 
@@ -104,7 +112,7 @@ provider = SibylMemoryProvider(
 
 ## Free tier
 
-- 2 MB local soft cap (with server-authoritative tier verification at the cap boundary)
+- 5 MB local soft cap (with server-authoritative tier verification at the cap boundary)
 - Single device
 - All five tiers (HOT/WARM/COLD/REFERENCE/ARCHIVE)
 - FTS5 full-text search across entities + state + reference + journal

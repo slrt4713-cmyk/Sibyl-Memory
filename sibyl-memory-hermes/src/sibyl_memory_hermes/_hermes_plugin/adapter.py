@@ -26,6 +26,13 @@ Configuration:
     which defaults to <HERMES_HOME>/sibyl/memory.db so each profile has
     its own database.
 
+Environment overrides:
+    SIBYL_TENANT_ID (non-secret): when set to a non-empty value, it becomes
+    the active tenant and wins over any tenant in credentials.json, matching
+    the SDK provider precedence (explicit > credentials > default). Absent or
+    blank leaves tenant resolution untouched. This is an identifier, not a
+    secret, and is never logged as a value.
+
 v0.3.1 hardening (audit-remediation):
     - Hermes ABC + tool_error imports are guarded: module imports cleanly
       outside Hermes (tests, dry-run tooling). Off-Hermes the adapter
@@ -249,7 +256,16 @@ SEARCH_SCHEMA = {
         "FTS5 full-text search across ALL Sibyl tiers (entities + state + "
         "reference + journal) for this tenant. Each hit carries a `tier` tag "
         "so you know where the match came from. Returns ranked matches. Use "
-        "whenever you want past context but don't know the exact (category, name)."
+        "whenever you want past context but don't know the exact (category, name).\n"
+        "An EMPTY `results` always ships with a `verdict` saying why. When "
+        "verdict.code is 'abstained_on', one word in your query (verdict.tokens[0]) "
+        "appears nowhere in this store and blocked the whole query — drop exactly "
+        "that word and call again, unchanged otherwise; repeat once if a second "
+        "word blocks the retry, then STOP (at most two retries: past that the "
+        "loop stops recovering your question and starts answering a shorter one). "
+        "'gated' means rows were found and dropped for weak "
+        "relevance (use more of the exact stored wording). 'empty_store' means "
+        "nothing has been written yet. 'no_match' is an honest miss."
     ),
     "parameters": {
         "type": "object",
@@ -329,13 +345,16 @@ class SibylAdapter(MemoryProvider):
     def initialize(self, session_id: str, **kwargs: Any) -> None:
         from sibyl_memory_hermes import SibylMemoryProvider
 
-        configured_tenant = os.environ.get("SIBYL_TENANT_ID")
-        if configured_tenant is not None:
-            configured_tenant = configured_tenant.strip()
-            if not configured_tenant:
-                raise ValueError("SIBYL_TENANT_ID must not be empty")
-
         self._session_id = session_id
+
+        # Non-secret env override for the active tenant. An explicit SIBYL_TENANT_ID
+        # wins over anything in credentials.json, matching the SDK provider's
+        # documented precedence (explicit tenant_id > credentials > DEFAULT_TENANT).
+        # Absent or blank leaves tenant resolution untouched: the provider still
+        # auto-loads credentials.json and resolves tenant the same way it does today.
+        env_tenant = os.environ.get("SIBYL_TENANT_ID", "").strip()
+        tenant_override = env_tenant or None
+
         hermes_home_raw = kwargs.get("hermes_home") or str(_hermes_home())
         self._hermes_home = Path(hermes_home_raw)
         self._agent_context = kwargs.get("agent_context", "primary") or "primary"
@@ -363,17 +382,13 @@ class SibylAdapter(MemoryProvider):
         # to DEFAULT_TENANT pre-activation rather than crash on first run.
         self._sibyl = SibylMemoryProvider(
             db_path=db_path,
-            tenant_id=configured_tenant,
+            tenant_id=tenant_override,
             autoload_credentials=True,
             require_credentials=False,
         )
-        logger.info(
-            "Sibyl memory initialized: db=%s session=%s profile=%s tenant=%s",
-            db_path,
-            session_id,
-            self._profile,
-            self._sibyl.tenant_id,
-        )
+        logger.info("Sibyl memory initialized: db=%s session=%s profile=%s tenant_override=%s",
+                    db_path, session_id, self._profile,
+                    "set" if tenant_override else "unset")
 
     @staticmethod
     def _safe_profile(name: str) -> str:
@@ -435,6 +450,12 @@ class SibylAdapter(MemoryProvider):
             "proper nouns you stored (names, ids, categories) over a full natural-language "
             "question. For a multi-concept query, search each key term separately and merge "
             "the results, or use sibyl_recall when you know the category and name.\n"
+            "  An empty result is never silent: it carries a `verdict`. verdict.code="
+            "'abstained_on' means the single word in verdict.tokens[0] is absent from the "
+            "store and blocked everything else — drop that word and search again, at "
+            "most TWICE (past two retries the loop answers a shorter question, not "
+            "yours). 'gated' = found but too weakly matched; 'empty_store' = "
+            "nothing written yet; 'no_match' = a genuine miss.\n"
             "- sibyl_list(category?, status?): browse what's remembered"
         )
 
@@ -618,14 +639,27 @@ class SibylAdapter(MemoryProvider):
                 # Run15 multi-record fix (Terminal B): workflow queries spanning
                 # several linked records surface them all (retrieve-then-verify).
                 # See provider.search_multi_record / sibyl_memory_client.multi_record.
-                hits = self._sibyl.search_multi_record(query, limit=limit)
+                found = self._sibyl.search_multi_record(query, limit=limit)
+                # The verdict rides on the RETURN (stage 3, 2026-08-31), so read
+                # it BEFORE the comprehensions below turn the carrier back into a
+                # plain list. getattr-with-fallback keeps this adapter working
+                # against an older sibyl-memory-client that predates the contract.
+                verdict = getattr(found, "verdict", None)
+                hits = list(found)
                 # F5: cap each hit body so one oversized value can't flood context.
                 hits = [_truncate_hit_body(h) for h in hits]
                 # F1/MH-6: strip any forged fence markers per-value BEFORE
                 # serialization (JSON-escaped markers can't bypass the regex,
                 # and the JSON envelope is never mangled by the substitution).
                 hits = [_scrub_value(h) for h in hits]
-                return json.dumps({"results": hits}, default=str)
+                payload: dict[str, Any] = {"results": hits}
+                if verdict is not None:
+                    # Numbers, enum values and the caller's own query tokens —
+                    # no record text by construction. Scrubbed anyway, so a
+                    # future field that forgets that rule is caught by the fence
+                    # instead of becoming a second channel out of the store.
+                    payload["verdict"] = _scrub_value(verdict.as_dict())
+                return json.dumps(payload, default=str)
 
             if tool_name == "sibyl_list":
                 category = args.get("category")
@@ -749,10 +783,11 @@ class SibylAdapter(MemoryProvider):
         for credentials that already live in the Sibyl native file -
         running both flows would diverge tenant ids and confuse users.
 
-        If a future version needs Hermes-side overrides (alt db_path,
-        explicit tenant_id for testing), add them here as non-secret
-        fields: keep secrets in credentials.json so there's one
-        source of truth.
+        Tenant selection has a non-secret env override, SIBYL_TENANT_ID, read in
+        initialize(). It is deliberately NOT surfaced as a config-schema field: it
+        is an env var, not a Hermes setup prompt, so `hermes memory setup` still
+        returns [] and never double-prompts. Secrets stay in credentials.json as the
+        single source of truth.
         """
         return []
 

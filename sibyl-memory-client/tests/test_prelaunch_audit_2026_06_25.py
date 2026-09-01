@@ -35,13 +35,25 @@ from sibyl_memory_client.storage import db_size_bytes
 # ======================================================================
 # CAP-1 — WAL-inclusive sizing: data that lands in the WAL is counted
 # ======================================================================
+#
+# UN-MASKED 2026-08-06: v0.5.0's folded-trigram search shadow enlarges the
+# on-disk footprint (spec §6), and under the OLD 2 MiB free cap these two
+# near-cap sizing tests tripped CapExceededError before the sizing assertion
+# could run — so they were temporarily run behind a no-op cap gate. The free cap
+# was raised to 5 MiB (operator directive; see client FREE_TIER_CAP_BYTES). At
+# 5 MiB their real footprints (~3.3 MiB and ~2.7 MiB) sit comfortably under the
+# cap, so the no-op gate is removed and they exercise the REAL default free gate
+# again — the sizing invariant is now proven end-to-end with genuine enforcement.
+
 
 def test_cap1_wal_resident_writes_are_counted(tmp_path: Path) -> None:
     """A committed write that still lives in memory.db-wal (no checkpoint forced)
     must be reflected in db_size_bytes. Sizing memory.db alone would under-report
     and let a free user write past the cap during a burst."""
     db = tmp_path / "memory.db"
-    c = MemoryClient.local(db, tenant_id="qa")
+    # Real default free gate (5 MiB): the shadow-inclusive footprint of these
+    # writes (~3.3 MiB) stays under the raised cap, so no masking is needed.
+    c = MemoryClient(Storage(str(db)), tenant_id="qa")
     # First write so the DB + WAL exist.
     c.set_entity("notes", "seed", {"text": "x"})
     baseline = db_size_bytes(db)
@@ -64,7 +76,9 @@ def test_cap1_size_helper_counts_wal_over_main_only(tmp_path: Path) -> None:
     """db_size_bytes (logical/page-count based) must exceed the bare memory.db
     file size when committed data is still in the WAL."""
     db = tmp_path / "memory.db"
-    c = MemoryClient.local(db, tenant_id="qa")
+    # Real default free gate (5 MiB): shadow-inclusive footprint (~2.7 MiB) stays
+    # under the raised cap — subject is db_size_bytes' WAL-inclusive sizing.
+    c = MemoryClient(Storage(str(db)), tenant_id="qa")
     big = "z" * 100_000
     for i in range(6):
         c.set_entity("notes", f"e-{i}", {"text": big})

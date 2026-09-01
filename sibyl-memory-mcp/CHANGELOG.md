@@ -4,6 +4,142 @@ All notable changes to `sibyl-memory-mcp` are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning follows
 [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- User-facing copy corrected from 2 MB to 5 MB to match the free-tier cap
+  raised in `sibyl-memory-client` 0.5.0. No behaviour change.
+
+## [0.2.0] "Lucid" - 2026-08-31
+
+Minor version, not a patch: the `memory_search` **response schema changed**. Every
+response, including every zero, now carries an additive `verdict` object, and a
+client that pins the old flat `{ok, query, count, results}` shape should read this
+entry before upgrading. Nothing was removed from the response and no field changed
+meaning.
+
+- Floors `sibyl-memory-client>=0.8.0` and `sibyl-memory-hermes>=0.4.0`. The verdict
+  is produced by the client and forwarded by this server, so an MCP server on the
+  new response schema over an old client would advertise a field the engine below
+  it cannot fill. The hermes floor is there for the same reason: this package's
+  install can pull the provider, and pip's default only-if-needed upgrade strategy
+  leaves an already-satisfying older sibling in place, which is exactly the
+  packaging hazard the 0.1.14 floor raise was for.
+- **Docker-image users must rebuild.** A self-built `sibyl-memory-mcp` image pins
+  its dependencies at image build time; a `pip install -U` on the host does not
+  reach inside it. Rebuild the image to pick this up.
+
+### Added
+- **`memory_search` responses now carry a `verdict`** (branch
+  `lang-core-verdict`, 2026-08-31). Until this release `server.py` called
+  `multi_record_search(client, query, limit=safe_limit)` with **no
+  `diagnostics=` kwarg**, so the SDK's optional explanation channel — which had
+  existed since 0.1.14 — was unreachable from the tool an agent actually calls.
+  A `count: 0` reached the agent as `{ok, query, count, results}` and could not
+  be told apart from an empty store. The verdict now rides on the RETURN of
+  `multi_record_search`, so there is no call-site kwarg left to forget, and the
+  response gains one additive, bounded `verdict` object naming exactly one of
+  `abstained_on` / `negation_abstain` / `gated` / `empty_store` / `no_match`,
+  with `recovery` and a plain-language `explain`.
+- The verdict passes through `_scrub_value` and sits beside the fenced payload.
+  It carries numbers, enum values and the caller's own query tokens — never
+  stored-record text — so it composes with the MH-1 fence and the MH-2 output
+  budget rather than becoming a second, unfenced channel out of the store. It is
+  reconciled against `count` after `_bound_hits`, so the two can never disagree.
+- **The `_MIN_QUERY_LEN` short-query guard names a cause too.** It was the one
+  place a `count: 0` shipped with nothing attached at all.
+- The tier-filtered (`tiers=`) path carries a verdict as well: bypassing the
+  linker does not bypass the contract.
+
+### Changed
+- **The `memory_search` docstring no longer teaches `tiers="entity"` as the
+  escape hatch from an abstention.** That advice routed around every precision
+  gate, including the one that makes injection-shaped queries return nothing. It
+  is replaced by the cause-scoped recovery: on `abstained_on`, drop the one token
+  named in `verdict.tokens[0]` and retry with every gate still armed, at most
+  twice. `tiers` remains documented as the linker bypass, with its precision
+  tradeoff stated. **No server-side auto-retry** — the loop stays agent-side,
+  because a silent server-side retry is indistinguishable from the silent zero
+  this contract deletes. A test asserts the server calls `multi_record_search`
+  exactly once per request.
+
+### Unchanged
+- Search behaviour is untouched. The MCP stdio path is byte-identical to
+  `ef98f5b` on every quality field of the full multilingual battery.
+
+### Fixed (independent adversarial review, 2026-08-31)
+- **The empty-store probe ran twice on the default path** (8 `COUNT(*)` per zero
+  where the pre-contract build took 1): the engine resolves `EMPTY_STORE` at its
+  own single exit, and this tool called `refine_zero` on top. `refine_zero` now
+  runs on the `tiers` branch only, where `client.search` genuinely does not
+  probe. Back to 1 `COUNT(*)` per zero.
+- The no-server-retry test asserts the absence of `ast.For` / `ast.While` rather
+  than grepping for the words, which had it firing on the tool docstring and on a
+  legitimate generator expression. The docstring's cause names are now asserted
+  against the `VerdictCode` values, so a rename cannot ship a stale instruction
+  to the agent with a green suite.
+
+## [0.1.14] - 2026-08-22
+
+### Changed
+- **Dependency floor raised to `sibyl-memory-client>=0.7.0`, closing a
+  packaging hazard** (cryptoxdylan, independent verification, 2026-08-18): the
+  prior floor (`>=0.5.0`) meant `pip install -U sibyl-memory-mcp` alone was a
+  silent no-op once a newer client existed on PyPI — pip's default
+  only-if-needed upgrade strategy leaves an already-satisfying older client in
+  place, so an MCP-only install (a self-built Docker image, a `pipx`-isolated
+  install, anything not going through `sibyl-memory-cli`'s tighter floor)
+  could sit on unpatched retrieval code indefinitely while reporting a clean
+  install. Picks up the client 0.7.0 N4/N5/N1'-diagnostics fixes.
+- **`memory_search` docstring documents the default-path abstention
+  contract.** No behavior change — the untiered path has always been able to
+  return `count: 0` on an ordinary paraphrase carrying one unsupported content
+  word, indistinguishable from an empty store. The docstring now says so
+  explicitly and tells a caller to retry with `tiers="entity"` (or the
+  expected tier) when a query that should match returns nothing.
+
+## [0.1.13-fixes] - 2026-08-16 (folded into 0.1.13, no separate release)
+
+### Fixed
+- **Default `memory_search` path (tiers omitted) now answers question-shaped
+  queries.** No `server.py` change — the untiered path routes through the client's
+  `multi_record_search`, which previously abstained (`count == 0`) whenever a
+  query carried a zero-support *function* word (`kiedy`, `gdzie`, `when`, `who`,
+  `how`, ...). The client's N1 fix classifies zero-df tokens so function-shaped
+  ones are dropped while content-shaped absences (injection / `rejected` class)
+  still abstain. Default-path recall on a PL/EN question battery went **1/8 →
+  8/8**; the tool-boundary abstention contract is unchanged (`co0001
+  nonexistenttokenzzzq report` and `was the co0001 order rejected` still return
+  `count == 0`). Requires `sibyl-memory-client` with the N1/N2/N3 recall fixes
+  (0.6.x follow-up to 0.6.0). New coverage:
+  `tests/test_default_path_recall_2026_08_16.py`.
+
+### Added
+- **First-party Docker packaging (repo-root `Dockerfile`,
+  `docker-compose.yml`, `.dockerignore`) and a README "Run with Docker"
+  section.** Non-root user, pinned slim Python base, no secrets baked in,
+  memory on a mounted volume. These are repo-level infra and docs only: the
+  published wheel contents are unchanged at the time this section was written
+  — see 0.1.14 above, which is the release that actually needed a version
+  bump for retrieval fixes. The Docker files ship via the GitHub source sync.
+  **Caveat surfaced 2026-08-22**: an image built with `docker build` from this
+  Dockerfile bakes in whatever `sibyl-memory-client` is on PyPI at BUILD time
+  (`pip install /app/sibyl-memory-mcp` inside the image, not a floating
+  install) — rebuild the image (`docker build -t sibyl-memory-mcp:local .`)
+  to pick up a newer client; a running or previously-built container does not
+  update itself.
+
+## [0.1.13] - 2026-08-06
+
+### Changed
+- **Dependency floor raised to `sibyl-memory-client>=0.5.0`** to pick up
+  multi-language search (schema v4). The untiered `memory_search` path (which
+  routes through the client's `multi_record` linker + `MemoryClient.search`) now
+  resolves non-ASCII / non-Latin / CJK / Thai / compound-token queries that
+  previously returned nothing — a 100-language write+query sweep went from 21/100
+  to 100/100. No `server.py` code change: the improvement is entirely in the
+  client the MCP server calls. See `sibyl-memory-client` 0.5.0.
+
 ## [0.1.12] - 2026-07-05
 
 Super-patch: recovery + adjudication of the remaining Fable 10-lens audit

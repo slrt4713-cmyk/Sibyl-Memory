@@ -17,6 +17,7 @@ from typing import Any
 
 from .exceptions import NotFoundError, StorageError, TenantError, ValidationError
 from .storage import Storage, db_size_bytes, dumps, loads, new_id, _utc_now_iso
+from .verdicts import SearchResults, no_match_verdict, ok_verdict, stamp
 
 _log = logging.getLogger(__name__)
 
@@ -535,6 +536,24 @@ def _relaxed_query_strings(query: str):
     surface). Order: stopword-stripped (recovers most paraphrase misses), then
     the rarest single token (last-resort recall).
     """
+    for cand, _last_resort in _relaxed_query_variants(query):
+        yield cand
+
+
+def _relaxed_query_variants(query: str):
+    """``(candidate, is_last_resort)`` for every relaxed variant, in order.
+
+    Exactly the sequence ``_relaxed_query_strings`` yields; the flag distinguishes
+    the two stages, which differ in quality by a lot and now have to be told
+    apart (see MemoryClient.search):
+
+      * stage 1, ``is_last_resort=False`` — the stopword-stripped CONJUNCTION,
+        which still requires every content token and so answers the whole
+        question.
+      * stage 2, ``is_last_resort=True`` — ONE token, longest first. The
+        docstring above already calls this last-resort recall: it is the weakest
+        answer this client can produce.
+    """
     toks = _match_tokens(query)
     if len(toks) < 2:
         return  # single-token queries have nothing to relax
@@ -544,11 +563,15 @@ def _relaxed_query_strings(query: str):
     if content and len(content) < len(toks):
         cand = " ".join(content)
         seen.add(cand)
-        yield cand
+        yield cand, False
     # 2) each content token alone, longest-first (length = cheap rarity proxy).
     #    The wrapper stops at the first variant that returns hits, so the most
     #    specific term is tried before more common ones. Last-resort recall.
-    for tok in sorted(set(content or toks), key=len, reverse=True):
+    # (-len, token): longest first, ties broken by the token itself. The old
+    # `key=len, reverse=True` was a stable sort over a SET, so equal-length
+    # tokens came out in randomised string-hash order and the same query could
+    # answer differently in different processes (review finding 11).
+    for tok in sorted(set(content or toks), key=lambda t: (-len(t), t)):
         # CORE-11 (2026-06-25 pre-launch audit): the old len>=3 floor silently
         # dropped short alphanumeric identifiers (q3, v2, k8, s3) — exactly the
         # discriminating tokens a developer searches for. Recover any token of
@@ -559,10 +582,37 @@ def _relaxed_query_strings(query: str):
             continue
         if len(tok) >= 2 or any(ch.isdigit() for ch in tok):
             seen.add(tok)
-            yield tok
+            yield tok, True
 
 
-# F5 (red-team 2026-06-17): sanity ceiling on a single serialized body. The 2 MB
+# D2L (the coverage-gated stem rescue: _stem_token / _stem_truncated_query /
+# _head_searchable_text / _uncovered_stem_tokens, plus _STEM_MIN_TOKEN,
+# _STEM_DROP, _STEM_FLOOR and _GATE_ROW_BYTES) was REMOVED on 2026-08-30 by
+# the lang-core-strip operator directive, together with its probe ladder in
+# search(). It was a QUERY-time compensation for fusional morphology; the
+# replacement is the WRITE-time normalization built on the shadow table (stage
+# 2, 2026-08-30): ONE versioned normalizer in shadow.py renders the stored text
+# at write time and the query at read time, and the truncation parameters that
+# lived here are now shadow.normalize_token. Git history at 63a5ea9 holds the
+# removed code verbatim if it is ever needed for reference.
+
+
+def _unshortened_single_token(query: str) -> bool:
+    """True for a ONE-token query whose token the ending rule left alone.
+
+    The single shape that gets no shadow consult on a non-empty strict head. Such
+    a token has nothing to recover and nothing to corroborate with: no inflected
+    variant the truncation could reach, and no second term to agree with it. So
+    'stock', 'form' and 'k8' behave exactly as they did on the stripped base,
+    which is what keeps 'stock' from dragging in 'stocktake' through a substring
+    append and keeps df at 1 where the strip put it.
+    """
+    from .shadow import normalize_terms
+    terms = normalize_terms(query)
+    return len(terms) == 1 and not terms[0][1]
+
+
+# F5 (red-team 2026-06-17): sanity ceiling on a single serialized body. The 5 MB
 # free cap bounds TOTAL memory, but one oversized value still floods agent context
 # on recall/search. This high ceiling rejects only pathological single values;
 # per-hit search output is additionally truncated at the tool boundary (adapter).
@@ -660,7 +710,7 @@ class MemoryClient:
         self._account_id = account_id
         self._session_token = session_token
 
-        # Cap gate: enforces the 2 MB free-tier cap with server-authoritative
+        # Cap gate: enforces the 5 MB free-tier cap with server-authoritative
         # tier verification at the boundary. See _capcheck.py for the design.
         if cap_gate is None:
             from ._capcheck import CapGate, TierCache, aggregate_db_size
@@ -723,8 +773,8 @@ class MemoryClient:
 
         Pass ``account_id`` and ``session_token`` from credentials.json so
         the SDK can verify the user's tier against the server when they
-        approach the 2 MB free-tier cap. Without these, the SDK enforces
-        a strict local 2 MB cap (no server check possible).
+        approach the 5 MB free-tier cap. Without these, the SDK enforces
+        a strict local 5 MB cap (no server check possible).
         """
         storage = Storage(path)
         return cls(
@@ -848,7 +898,7 @@ class MemoryClient:
         conflict the existing row is updated (body + status + updated_at).
         Returns the resulting entity row as a dict.
 
-        Subject to the 2 MB free-tier cap when tier='free'. Raises
+        Subject to the 5 MB free-tier cap when tier='free'. Raises
         CapExceededError if the write would push the local DB past the cap
         and the server-authoritative tier check confirms the account is
         still free.
@@ -1099,7 +1149,7 @@ class MemoryClient:
         T1-3 fix: previously this bypassed the cap-gate. A free user at
         1.9 MB could archive their largest entities (body copied into
         archived_entities, doubling footprint temporarily before the
-        DELETE lands) to keep writing past the 2 MB cap. Now gated on
+        DELETE lands) to keep writing past the 5 MB cap. Now gated on
         the size of the body being copied + 200 bytes overhead. Reads
         the body first so we know the actual delta. NotFoundError still
         raised before any cap-gate work.
@@ -1238,11 +1288,20 @@ class MemoryClient:
     # ------------------------------------------------------------------
     @_track_op("search_entities")
     def search_entities(self, query: str, *, limit: int = 20, prefix: bool = False,
-                        category: str | None = None) -> list[dict[str, Any]]:
+                        category: str | None = None) -> SearchResults:
         """Full-text search over entity name + category + body via FTS5.
 
         Returns warm-tier entity rows only. For cross-tier search (entities +
         state + reference + journal in one call), use ``search()``.
+
+        THE VERDICT CONTRACT (stage 3, 2026-08-31): this is the third and last
+        search entry point in the SDK, and it leaves through the same single
+        ``stamp()`` as the other two. A ``verdicts.SearchResults`` (a ``list``
+        subclass — every existing caller is byte-for-byte unaffected) carrying
+        ``OK`` or ``NO_MATCH``. Like ``search()`` it is a policy-free primitive:
+        no abstention, no relevance gate, so no other cause is reachable, and
+        the ``EMPTY_STORE`` probe is left to whichever surface reports the zero
+        (``verdicts.refine_zero``).
 
         Query is sanitized as a single FTS5 phrase: column-filter syntax
         (``name:foo``) and unclosed quotes can't escape into the parser.
@@ -1262,7 +1321,10 @@ class MemoryClient:
         limit = _clamp_limit(limit)  # CORE-5: negative=unbounded; huge=full-scan. Clamp.
         match_q = _sanitize_fts5_query(query, prefix=prefix)
         if not match_q:
-            return []
+            # An empty / invalid query is a zero like any other, and it names a
+            # cause like any other. `tokens_total=0` is what lets explain() say
+            # "the query carried no searchable terms" instead of guessing.
+            return stamp([], no_match_verdict(tokens_total=0))
         # external-content FTS5: join by rowid back to base table.
         # _fts_query handles classification (v0.4.0 KAPPA) + corruption
         # containment (poisoned-index DatabaseError self-heals or returns []).
@@ -1304,11 +1366,38 @@ class MemoryClient:
                 keyed.append((_proximity_bucket(query_tokens, text), idx, e))
             keyed.sort(key=lambda t: (t[0], t[1]))
             ents = [t[2] for t in keyed]
-        return ents
+        return stamp(ents, ok_verdict())
 
     @_track_op("search")
     def search(self, query: str, *, limit: int = 20, prefix: bool = False,
-               tiers: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
+               tiers: tuple[str, ...] | None = None) -> SearchResults:
+        """Cross-tier search that always says why it returned what it returned.
+
+        THE VERDICT CONTRACT (stage 3, 2026-08-31). Thin wrapper over
+        ``_search_rows`` — the unchanged search body, ladder and all — whose only
+        job is to be the SINGLE EXIT: whatever the ladder inside returns leaves
+        through one ``stamp()`` and arrives carrying a ``verdict``.
+
+        The return is a ``verdicts.SearchResults``: a ``list`` subclass, so every
+        existing caller (``len``, iteration, indexing, ``== []``,
+        ``json.dumps``, ``isinstance(x, list)``) is byte-for-byte unaffected,
+        with ``.verdict`` attached. Only two causes are reachable at this level,
+        because ``search()`` is a policy-free primitive with no abstention and no
+        relevance gate: ``OK`` when rows came back, ``NO_MATCH`` when they did
+        not. A user-facing surface (the CLI, the MCP tool) may pay one probe via
+        ``verdicts.refine_zero`` to upgrade that ``NO_MATCH`` to ``EMPTY_STORE``.
+        The probe is deliberately NOT taken here: ``multi_record_search`` calls
+        this method once per query token, and a COUNT per token would be a real
+        per-query cost for an explanation only the outermost caller needs.
+
+        Which rows come back is unchanged. See ``_search_rows`` below for the
+        search behaviour and its history.
+        """
+        rows = self._search_rows(query, limit=limit, prefix=prefix, tiers=tiers)
+        return stamp(rows, ok_verdict())
+
+    def _search_rows(self, query: str, *, limit: int = 20, prefix: bool = False,
+                     tiers: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
         """Cross-tier search with a zero-hit paraphrase fallback.
 
         Runs the strict AND + proximity search first (``_search_strict``,
@@ -1319,15 +1408,200 @@ class MemoryClient:
         existing hits cannot regress, and single-token / prefix queries (the
         multi_record path) never trigger the fallback. (paraphrase recall, beta
         deadguy 2026-06-14: NL queries miss under strict token-AND.)
+
+        LANG-CORE-STRIP (operator directive, 2026-08-30): the 0.6.0/0.6.1/0.7.0
+        QUERY-TIME rescue layers that used to sit here were removed and this body
+        reverted to its 0.5.0 form. Removed: the F2 unconditional shadow append
+        (the shadow is once again a zero-hit-only fallback), the D2L coverage-
+        gated stem rescue and its selectivity-ordered probe ladder (N3/N3'), and
+        the N2 relaxed-single holdback/backfill that existed only to give that
+        rescue headroom. search() is now exactly: strict head, relaxed variants
+        on zero, zero-hit shadow fallback, nothing else.
+
+        What is deliberately NOT removed: shadow.py in full (the folded-trigram
+        shadow table, its triggers, backfill and diacritic folding are the 0.5.0
+        foundation and the delivery vehicle for the stage-2 write-time
+        normalization), and multi_record.py in full (the abstention side — N4
+        any-df function-word drop, N5 negation abstention, the df==0 abstention
+        and the diagnostics channel — is not part of this removal).
+
+        Rationale: four external evaluation cycles accreted these layers at
+        QUERY time, each one compensating for the previous one's side effects
+        (F2's unconditional append polluted df, N2 held rows back to make room
+        for D2L, N3 reordered D2L's probes, N3' removed its early stop and cost
+        18 junk rows on a single query). The fix belongs at WRITE time. This
+        strip restores a clean base to build that on; it is a deliberate,
+        measured recall regression in Polish, not a bug.
         """
         hits = self._search_strict(query, limit=limit, prefix=prefix, tiers=tiers)
-        if hits or prefix:
+        if prefix:
             return hits
-        for relaxed in _relaxed_query_strings(query):
-            hits = self._search_strict(relaxed, limit=limit, prefix=False, tiers=tiers)
-            if hits:
-                return hits
-        return hits
+        if hits:
+            # THE NON-EMPTY-HEAD APPEND. The strict head is returned first and
+            # untouched, always; the shadow may only extend its tail, under the
+            # decisive guard, and only when it has something the head lacks.
+            #
+            # Two distinct recalls ride on this, and they were closed at different
+            # times for different reasons.
+            #
+            # TWIN MASKING (2026-08-07 Finding 2). A single-token query can be
+            # SATISFIED by a row in the other language and thereby hide the row in
+            # the query's own: 'packshot' porter-matches the English 'packshots'
+            # row, the head is non-empty, and the Polish 'Packshoty produktów' row
+            # is never reached. A whole-query zero gate structurally cannot see
+            # this. It is also the shape multi_record's df probes take, so this is
+            # what makes df truthful for inflected forms.
+            #
+            # LONG NATURAL-LANGUAGE RECALL (LongMemEval parity, 2026-08-31). The
+            # 0.7.0 F2 append also served real recall on MULTI-WORD queries with a
+            # non-empty head, and removing it wholesale made this branch retrieve a
+            # strict SUBSET of 0.7.0 on that workload: 9 of 100 questions lost
+            # answer-bearing context and 2 lost it entirely, because a long
+            # question's strict AND head is often one weak row and everything that
+            # actually answered it arrived in the appended tail. F2's diseases came
+            # from the append being UNGUARDED, not from the append existing, so the
+            # append is back for multi-token queries with the guard in front of it.
+            #
+            # The single exception is a single token the ending rule left alone
+            # ('stock', 'form', 'k8'): those have no inflected form to recover and
+            # no second term to corroborate, so they get no probe at all, which is
+            # what preserves the precision the strip bought.
+            if not _unshortened_single_token(query):
+                hits = self._append_shadow(hits, query, limit=limit, tiers=tiers,
+                                           decisive_only=True)
+            return hits
+        # v0.5.0 multi-language search (spec §4.3): the folded-trigram shadow,
+        # reached ONLY when the strict pass produced nothing, so a non-empty
+        # STRICT result is never reordered or dropped. prefix queries already
+        # returned above (prefix intent != substring fallback). The shadow gives
+        # substring semantics (matches inside an unbroken CJK/Thai/Bantu/compound
+        # token) + a folded copy for the non-decomposable ł/ß/ø/... class, in any
+        # language. Since v0.8.0 it runs the NORMALIZED pass: the same normalizer
+        # the write side used, inflected tokens truncated to a stem, rows ranked
+        # by idf-weighted coverage of the query's content terms.
+        #
+        # ORDER: the relaxed ladder runs FIRST and the shadow last, exactly as in
+        # 0.5.0. An earlier v0.8.0 revision put the shadow first and that was
+        # wrong (adversarial review 2026-08-30, finding 1). The relaxed ladder
+        # searches with FTS5 PORTER, which reaches 'story' from 'stories'; the
+        # shadow only does substring on a fixed-length truncation, and 'stori' is
+        # not a substring of 'story' but IS one of 'historic'. Shadow-first
+        # therefore answered with an unrelated row and the ladder never ran, so
+        # the correct row was LOST — the same shape for entries/centrifuge,
+        # queries/querist, and for every digit-bearing identifier, which is never
+        # shortened and so contributes nothing to the shadow while CORE-11 exists
+        # precisely to give it last-resort recall.
+        # How the two rescues share the space below an empty strict head:
+        #
+        #   stage-1 head (the stopword-stripped CONJUNCTION) wins outright. It
+        #     still required every content token, so it answered the question,
+        #     and it is a PORTER answer, which reaches inflections the shadow's
+        #     fixed-length truncation cannot ('stories' -> 'story').
+        #   stage-2 head (ONE token, last resort) keeps its rows and its order,
+        #     and the shadow is APPENDED after it under the decisive guard. When
+        #     the head already fills the caller's limit there is no room, so the
+        #     head is returned untouched. That is 0.5.0 semantics and it is all
+        #     that happens here.
+        #
+        # NOTHING OVERRIDES THE HEAD. Two revisions of this method carried an
+        # exception that discarded a last-resort head which filled the limit, on
+        # the theory that saturation meant the token had matched indiscriminately.
+        # Both discriminators were refuted by a fresh case that lost correct rows:
+        # saturation alone killed 'quarterly reconciliation' (20 reconciliation
+        # rows replaced by one quartermaster row), and saturation-plus-degraded
+        # killed 'quarterly audits' the same way, because the ladder orders by
+        # raw token LENGTH, a rarity proxy and not a relevance one, so degrading
+        # onto a shorter token is no evidence that the token is wrong. The
+        # exception is deleted rather than narrowed a third time.
+        #
+        # The accepted cost is one query shape: 'termin rozpatrzenia reklamacji'
+        # relaxes to 'termin', which sweeps up the boilerplate phrase in every
+        # stored note and fills the cap with it, so that query is now no better
+        # than released 0.7.0. Deliberate residual, recorded in stage2-report.md
+        # §5 with the acceptance amendment. Ranking a weak head below a better
+        # answer is scoring work, not a query-time special case.
+        relaxed_hits: list[dict[str, Any]] = []
+        for relaxed, _last_resort in _relaxed_query_variants(query):
+            found = self._search_strict(relaxed, limit=limit, prefix=False,
+                                        tiers=tiers)
+            if found:
+                relaxed_hits = found
+                break
+        if relaxed_hits:
+            # Either stage's head keeps its rows and its order, and the shadow is
+            # APPENDED after it under the guard. Until 2026-08-31 a stage-1
+            # conjunction head returned outright with no append, and the
+            # LongMemEval parity run measured what that costs: on 'How much did I
+            # earn at the Downtown Farmers Market on my most recent visit?' the
+            # conjunction answers with one raw session and the row that states the
+            # figure was one guarded probe away. A head is a reason to rank the
+            # shadow below it, not a reason to refuse to look.
+            return self._append_shadow(relaxed_hits, query, limit=limit,
+                                       tiers=tiers, decisive_only=True)
+        return self._shadow_fallback(query, limit=limit, tiers=tiers,
+                                     normalize=True)
+
+    def _append_shadow(self, hits: list[dict[str, Any]], query: str, *, limit: int,
+                       tiers: tuple[str, ...] | None,
+                       decisive_only: bool = False) -> list[dict[str, Any]]:
+        """Append normalized shadow rows after an existing head, de-duped, capped.
+
+        Never reorders, never drops, never re-ranks the head — the head list is
+        returned unchanged when the shadow adds nothing, and the shadow's own rank
+        scale stays positional-only (see shadow._shape_hit)."""
+        if len(hits) >= limit:
+            return hits
+        extra = self._shadow_fallback(query, limit=limit, tiers=tiers,
+                                      normalize=True, decisive_only=decisive_only)
+        if not extra:
+            return hits
+        seen = {(h.get("tier"), h.get("key"), h.get("category")) for h in hits}
+        out = list(hits)
+        # The journal cap is a property of the RESULT, not of one pass. Both
+        # _search_strict and the shadow apply max(1, limit//4) to their own rows;
+        # without this the two caps stack and a contentless journal can retake
+        # the result the cap exists to protect (test_journal_does_not_dominate_
+        # search, 2026-06-02). Count what the head already spent.
+        journal_cap = max(1, limit // 4)
+        journal_used = sum(1 for h in hits if h.get("tier") == "journal")
+        for h in extra:
+            ident = (h.get("tier"), h.get("key"), h.get("category"))
+            if ident in seen:
+                continue
+            if h.get("tier") == "journal":
+                if journal_used >= journal_cap:
+                    continue
+                journal_used += 1
+            seen.add(ident)
+            out.append(h)
+            if len(out) >= limit:
+                break
+        return out
+
+    def _shadow_fallback(self, query: str, *, limit: int = 20,
+                         tiers: tuple[str, ...] | None = None,
+                         normalize: bool = False,
+                         decisive_only: bool = False) -> list[dict[str, Any]]:
+        """Delegate a zero-hit search to the folded-trigram shadow (shadow.py).
+
+        A no-op ``[]`` when the shadow table is absent (a pre-migration or
+        read-only DB), and the shadow's own execution is error-contained
+        (OperationalError/DatabaseError -> ``[]`` + heal), so a broken or missing
+        shadow can never take down the primary search path. Any unexpected error
+        here is swallowed to ``[]`` for the same reason."""
+        # CORE-5: honor the same limit clamp as the primary path so the fallback
+        # can never broaden a negative/huge limit into SQLite's unbounded scan.
+        limit = _clamp_limit(limit)
+        if not limit:
+            return []
+        try:
+            from .shadow import shadow_search
+            with self._storage.connection() as conn:
+                return shadow_search(conn, self._tenant_id, query,
+                                     limit=limit, tiers=tiers,
+                                     normalize=normalize, decisive_only=decisive_only)
+        except Exception:
+            return []
 
     def _search_strict(self, query: str, *, limit: int = 20, prefix: bool = False,
                        tiers: tuple[str, ...] | None = None) -> list[dict[str, Any]]:

@@ -41,7 +41,31 @@ _SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 # transactional (rolls back with a failed rebuild), and reading it is O(1):
 #   0                     -> FTS never verified/rebuilt under this client
 #   _FTS_REBUILD_MARKER   -> the FTS index was (re)built AND its txn committed
+#   _SHADOW_MARKER        -> the v0.5.0 folded-trigram search shadow (shadow.py)
+#                            was created + backfilled AND its txn committed
 _FTS_REBUILD_MARKER = 3
+
+# v0.5.0 multi-language search (spec §5): schema v3 -> v4 adds the standalone
+# folded-trigram ``search_shadow`` table + its maintenance triggers (shadow.py),
+# stamped in PRAGMA user_version by the SAME crash-atomic machinery as the FTS
+# rebuild marker. Marker >= _SHADOW_MARKER (and the shadow table present) is the
+# fast-path signal that v4 is fully applied.
+#
+# v0.8.0 stage 2 (2026-08-30): the shadow's stored rendering changed from
+# fold_sql to normalize_sql, so every existing store must drop, recreate and
+# re-backfill its shadow on the next open or it would keep serving the old
+# rendering. The value now lives in shadow.py, NEXT TO the rendering it stamps,
+# because the migration here is not the only writer of that rendering:
+# shadow._heal rewrites it on the portability path and must stamp the same
+# marker (adversarial review 2026-08-30, finding 3). Marker 4 is the fold-only
+# rendering shipped as 0.7.0; marker 6 is NORMALIZER_VERSION 1.
+from .shadow import SHADOW_MARKER as _SHADOW_MARKER
+from .shadow import assert_sqlite_supported as _assert_sqlite_supported
+
+# Ordinary lock wait, and the widened one that covers a schema apply plus a
+# shadow re-backfill on a large store (review finding 4).
+_BUSY_TIMEOUT_MS = 5000
+_MIGRATION_BUSY_TIMEOUT_MS = 180000
 
 # v0.4.0 (2026-05-18, KAPPA RED finding): the SQLite DB holds every entity
 # body, not just credentials. docs.sibyllabs.org/memory/install claims 0600
@@ -314,7 +338,7 @@ class Storage:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = NORMAL")  # safe with WAL, faster than FULL
-        conn.execute("PRAGMA busy_timeout = 5000")  # 5s before SQLITE_BUSY
+        conn.execute(f"PRAGMA busy_timeout = {int(_BUSY_TIMEOUT_MS)}")
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -403,7 +427,14 @@ class Storage:
         After applying the schema, runs any pending migrations. v2 to v3 (2026-05-18)
         is the only migration currently: it reshapes FTS5 tables from standalone
         (body duplicated) to external-content (body lives in base tables only).
-        Migration runs once and is idempotent thereafter."""
+        Migration runs once and is idempotent thereafter.
+
+        The SQLite floor is checked FIRST, before the schema executescript and
+        therefore before any migration write: below it the failure surfaces deep
+        inside the v4 shadow migration as "error in tokenizer constructor", which
+        names neither the minimum nor the found version. One number, enforced,
+        living in shadow.py next to the tokenizer it is a floor for."""
+        _assert_sqlite_supported()
         if not _SCHEMA_PATH.exists():
             raise SchemaError(
                 "Schema file missing from package install",
@@ -411,15 +442,38 @@ class Storage:
             ) from None
         sql = _SCHEMA_PATH.read_text(encoding="utf-8")
         with self.connection() as conn:
+            # The open path is where a SECOND process WAITS (review finding 4,
+            # reopened). The first opener after a marker bump holds BEGIN
+            # IMMEDIATE for the whole shadow re-backfill, measured at 1.65 s for
+            # 10k rows and 27 s for 100k. b0b6e31 widened busy_timeout inside
+            # _migrate_if_needed, which is the lock HOLDER's connection and is
+            # unreachable code for the waiter: it blocks here, in executescript,
+            # and died at the 5 s connection default above roughly 25k rows.
+            # Widen for the whole of schema-apply plus migration, which is
+            # exactly the span a concurrent opener can be blocked for, then put
+            # it back so the ordinary read path keeps failing fast.
+            conn.execute(f"PRAGMA busy_timeout = {int(_MIGRATION_BUSY_TIMEOUT_MS)}")
             try:
                 conn.executescript(sql)
             except sqlite3.Error as e:
                 raise SchemaError(
                     f"Failed to apply schema: {e}",
-                    recovery="Check sqlite3 version (need 3.38+ for json_valid). On older systems, upgrade.",
+                    # The floor is asserted above and stated in ONE place
+                    # (shadow.SQLITE_MIN_VERSION). This message used to carry a
+                    # second, different, unverified number ("3.38+ for
+                    # json_valid"); json_valid is present at 3.34 in every build
+                    # that compiles JSON1 in, which CPython's bundled sqlite3 and
+                    # every distro build do, and it is unconditional from 3.38.
+                    recovery="Check disk space and file permissions on the store, then retry.",
                 ) from e
-        # Run migrations that need imperative work beyond CREATE IF NOT EXISTS.
-        self._migrate_if_needed()
+        # Run migrations that need imperative work beyond CREATE IF NOT EXISTS,
+        # still under the widened timeout, then restore the default on every
+        # connection this Storage holds.
+        try:
+            self._migrate_if_needed()
+        finally:
+            with self.connection() as conn:
+                conn.execute(f"PRAGMA busy_timeout = {int(_BUSY_TIMEOUT_MS)}")
 
     def _migrate_if_needed(self) -> None:
         """Run any pending schema migrations + guarantee the FTS index is built.
@@ -446,8 +500,18 @@ class Storage:
            content can't detect the emptied case and neither can
            'integrity-check', which is why the marker is the sole signal.)
 
-        Safe to call repeatedly: once the marker is set and the shape is v3,
-        this short-circuits with no scan and no rebuild.
+        3. **v3 → v4 (0.5.0) — folded-trigram search shadow.** Create the
+           standalone ``search_shadow`` trigram table + its maintenance triggers
+           and backfill all four tiers (shadow.py), then stamp
+           ``_SHADOW_MARKER`` in the SAME transaction (same crash-atomic pattern
+           as #2). The fast path returns only when the shape is v3, the marker is
+           ``>= _SHADOW_MARKER``, AND the shadow table is present — so a dropped/
+           corrupt shadow (or a rolled-back v4 migration) is rebuilt on the next
+           open. The shadow is derived state: base-table data is never touched
+           and it is always rebuildable.
+
+        Safe to call repeatedly: once the marker is v4 and the shape is v3 and the
+        shadow is present, this short-circuits with no scan and no rebuild.
         """
         with self.connection() as conn:
             row = conn.execute(
@@ -463,10 +527,30 @@ class Storage:
                 or "content='entities'" not in sql.replace(" ", "")
             )
             marker = self._fts_marker(conn)
+            from .shadow import shadow_table_exists, shadow_triggers_complete
+            shadow_ok = shadow_table_exists(conn)
+            # F1 (Fable hardening 2026-08-06): the shadow TABLE existing is not
+            # sufficient — the shadow is only kept consistent by its 10
+            # maintenance triggers. An out-of-band trigger drop leaves the table
+            # present but stale, so the fast path must ALSO require all 10
+            # triggers (cheap sqlite_master count). On mismatch we fall through
+            # to the idempotent apply_shadow_migration, which recreates every
+            # trigger — the same self-heal the v3 FTS triggers get on each open.
+            shadow_triggers_ok = shadow_triggers_complete(conn)
+            # The marker is necessary but not sufficient evidence (adversarial
+            # review 2026-08-30, finding 3): the rendering has a second writer
+            # in shadow._heal, and a store healed by an OLD client keeps the NEW
+            # marker over the OLD rendering. One O(1) sampled row closes that,
+            # whoever wrote it and whatever the marker claims.
+            from .shadow import rendering_is_current
+            shadow_rendering_ok = rendering_is_current(conn)
 
-        if not needs_v3_shape and marker >= _FTS_REBUILD_MARKER:
-            # v3 external-content shape AND the index was rebuilt + committed
-            # under this client. Fast path: no scan, no rebuild.
+        if (not needs_v3_shape and marker >= _SHADOW_MARKER
+                and shadow_ok and shadow_triggers_ok and shadow_rendering_ok):
+            # v3 external-content shape, the index was rebuilt + committed under
+            # this client, AND the v4 shadow is present WITH its full trigger set.
+            # Fast path: O(1), no scan, no rebuild, no shadow count(*) probe
+            # (spec §5).
             return
 
         try:
@@ -489,14 +573,33 @@ class Storage:
             # Rebuild the FTS indexes from the (intact) base tables and stamp the
             # crash-atomic marker in ONE transaction. If we crash here, the whole
             # transaction — marker included — rolls back, and the next open
-            # rebuilds again (the exact failure Real #3 fixes).
-            with self.transaction() as conn:
-                self._rebuild_fts_indexes(conn)
-                conn.execute(f"PRAGMA user_version = {int(_FTS_REBUILD_MARKER)}")
+            # rebuilds again (the exact failure Real #3 fixes). Only run when the
+            # v3 rebuild marker is not yet set (or we just reshaped); a healthy v3
+            # DB upgrading to v4 must not needlessly re-rebuild its FTS indexes.
+            if needs_v3_shape or marker < _FTS_REBUILD_MARKER:
+                with self.transaction() as conn:
+                    self._rebuild_fts_indexes(conn)
+                    conn.execute(f"PRAGMA user_version = {int(_FTS_REBUILD_MARKER)}")
+            # v3 → v4: create + backfill the folded-trigram search shadow and stamp
+            # _SHADOW_MARKER in ONE transaction (crash-atomic, same as #2). Also
+            # runs when marker is already >= 4 but the shadow table is missing OR
+            # any of its 10 triggers were dropped out-of-band (F1) — the heal for
+            # a dropped/corrupt shadow. apply_shadow_migration is idempotent
+            # (CREATE IF NOT EXISTS + DELETE + backfill), so recreating triggers
+            # and re-backfilling restores shadow↔base consistency.
+            if (marker < _SHADOW_MARKER or not shadow_ok or not shadow_triggers_ok
+                    or not shadow_rendering_ok):
+                from .shadow import apply_shadow_migration
+                with self.transaction() as conn:
+                    # The re-backfill is O(rows) and holds the write lock for
+                    # the whole of it. The busy timeout a concurrent opener needs
+                    # is widened in _ensure_schema, on the connection that waits.
+                    apply_shadow_migration(conn)
+                    conn.execute(f"PRAGMA user_version = {int(_SHADOW_MARKER)}")
         except (sqlite3.Error, StorageError, SchemaError) as e:
             raise SchemaError(
                 f"FTS5 index migration/rebuild failed: {type(e).__name__}",
-                recovery="Back up your memory.db, then delete it; the next open will create a fresh v3 DB. Your base-table data is unaffected by an FTS index rebuild failure: the index rebuilds on the next open.",
+                recovery="Back up your memory.db, then delete it; the next open will create a fresh v4 DB. Your base-table data is unaffected by an FTS index / search-shadow rebuild failure: both rebuild from the base tables on the next open.",
             ) from e
 
     def _rebuild_fts_indexes(self, conn: sqlite3.Connection) -> None:
@@ -524,6 +627,12 @@ class Storage:
               FROM journal_events
             """
         )
+        # v0.5.0 (spec §5): the folded-trigram search shadow is derived state too,
+        # so the existing heal/rebuild path covers it. rebuild_shadow is a no-op
+        # when the shadow table is absent (e.g. a fresh DB whose shadow is created
+        # by the later v4 migration step, so this v3 rebuild must not require it).
+        from .shadow import rebuild_shadow
+        rebuild_shadow(conn)
 
     @staticmethod
     def _fts_marker(conn: sqlite3.Connection) -> int:

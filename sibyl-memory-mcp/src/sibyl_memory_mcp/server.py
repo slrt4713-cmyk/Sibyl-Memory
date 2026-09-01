@@ -11,7 +11,7 @@
   - memory_record_event    append a COLD-tier journal event
 
 All operations run against the local SQLite at ~/.sibyl-memory/memory.db.
-The cap gate (free-tier 2 MB hard cap, paid-tier uncapped) is enforced
+The cap gate (free-tier 5 MB hard cap, paid-tier uncapped) is enforced
 automatically by the underlying sibyl-memory-client SDK: the MCP server
 just surfaces the typed errors back to the caller.
 
@@ -47,6 +47,15 @@ from sibyl_memory_client.exceptions import (
     TierGateError,
     TierVerificationError,
     ValidationError,
+)
+# THE canonical cause vocabulary (stage 3, 2026-08-31). Imported, never
+# re-declared here: a second copy of these names in the server is exactly how a
+# surface starts reporting a cause the engine does not emit.
+from sibyl_memory_client.verdicts import (
+    Verdict,
+    VerdictCode,
+    no_match_verdict,
+    refine_zero,
 )
 
 # Default install location matches the rest of the plugin ecosystem.
@@ -213,7 +222,7 @@ def _err(e: Exception) -> NoReturn:
     payload = {"error": cls, "message": str(e)}
     if isinstance(e, CapExceededError):
         payload["code"] = "CAP_EXCEEDED"
-        payload["recovery"] = "Run `sibyl upgrade` to lift the 2 MB free-tier cap."
+        payload["recovery"] = "Run `sibyl upgrade` to lift the 5 MB free-tier cap."
         payload["upgrade_url"] = getattr(e, "upgrade_url", "https://sibyllabs.org/plugin/upgrade")
     elif isinstance(e, TierGateError):
         payload["code"] = "TIER_GATED"
@@ -348,6 +357,21 @@ def _bound_hits(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         bounded.append(capped)
         used += size
     return bounded
+
+
+def _verdict_block(verdict: Verdict) -> dict[str, Any]:
+    """Render a verdict for the wire (stage 3, 2026-08-31).
+
+    The verdict is a CONTROL-plane object: numbers, enum members, and tokens the
+    caller typed. It never contains stored-record text, which is why it can sit
+    beside the fenced payload rather than inside it. It is still passed through
+    ``_scrub_value`` — one line, and it means that if a future edit ever lets a
+    record-derived string into a verdict field, the fence (MH-1) catches it
+    instead of it becoming a second, unfenced channel out of the store. The
+    envelope is bounded by construction (``verdicts.MAX_TOKEN_CHARS`` /
+    ``MAX_TOKENS_REPORTED``), so it cannot compete with the MH-2 output budget.
+    """
+    return _scrub_value(verdict.as_dict())
 
 
 def _fence(payload: dict[str, Any]) -> dict[str, Any]:
@@ -525,13 +549,78 @@ def build_server() -> FastMCP:
                 "entity,state" restricts to those two tiers and bypasses
                 the multi-record linker. Omit or pass null to search all
                 tiers with the multi-record linker active.
+
+        EVERY ZERO EXPLAINS ITSELF (verdict contract, 2026-08-31):
+            when `count` is 0 the response carries a `verdict` object naming
+            the one reason, so you never have to guess whether the store is
+            empty, your question was blocked, or nothing matched. Read
+            `verdict.code`, act on `verdict.recovery`, and use
+            `verdict.explain` if you need to tell a human:
+
+              abstained_on      ONE word in your query appears nowhere in this
+                                store, and an unsupported content word blocks
+                                the whole query. This is the precision gate that
+                                makes injection / made-up-term queries return
+                                nothing, so it is working as intended.
+                                RECOVERY — drop the word named in
+                                `verdict.tokens[0]` and call memory_search
+                                again with everything else unchanged. If a
+                                second, different word blocks the retry, drop
+                                that one too. **STOP AFTER TWO RETRIES.** Keep
+                                every gate armed; do NOT reach for `tiers` to
+                                escape the gate. Two is not arbitrary: it is
+                                where the rescue actually lives (measured 16/16
+                                on the customer's eval, and 99 of 122 blocked
+                                answerable questions on our own 155-question
+                                set, with 70 of those recovered in the FIRST
+                                retry), and it is the bound past which the loop
+                                stops recovering your question and starts
+                                answering a different, shorter one — strip
+                                enough words and any query decays into whatever
+                                fragment the store happens to support. The loop
+                                is YOURS to run: the server never retries on
+                                your behalf, because a silent server-side retry
+                                is indistinguishable from the silent zero this
+                                contract deletes.
+              negation_abstain  the query is negated and full-text search cannot
+                                honour a negation; answering would surface the
+                                record asserting the OPPOSITE.
+                                RECOVERY — ask the positive form and judge the
+                                answer yourself.
+              gated             rows WERE found and then dropped by a relevance
+                                gate (`verdict.gate`, with per-gate counts in
+                                `verdict.gate_drops` and how close the best row
+                                came in `verdict.best_pre_gate_coverage`).
+                                RECOVERY — use more of the exact stored wording,
+                                or search one distinctive term on its own.
+              empty_store       nothing has been written to this store yet.
+                                RECOVERY — write something first.
+              no_match          the query ran with every gate armed against a
+                                non-empty store and matched nothing. An honest
+                                miss. RECOVERY — broaden or rephrase.
+
+        On `tiers` (the linker bypass, and its price):
+            passing `tiers` calls client.search() directly. That path has no
+            abstention gate — and no injection precision gate either, which is
+            what the abstention gate IS. It is the right tool when you know the
+            tier you want and want the raw primitive's recall; it is the wrong
+            tool as a way to get around an `abstained_on` verdict, because it
+            buys those rows by turning off the check that makes unsupported
+            terms return nothing. Prefer the cause-scoped retry above; reach for
+            `tiers` deliberately, knowing the tradeoff.
         """
         try:
             # MH-4: mirror the adapter's _MIN_QUERY_LEN guard. A 1-2 char query
             # is noise (and degenerates to a full-corpus scan); return empty
             # rather than search.
             if query is None or len(query.strip()) < _MIN_QUERY_LEN:
-                return _fence({"ok": True, "query": query, "count": 0, "results": []})
+                # Even the guard's own zero names a cause. A `count: 0` with no
+                # verdict is the exact defect this contract closes, and a short
+                # query is the easiest place to reintroduce it.
+                short = no_match_verdict(tokens_total=0)
+                short.code = VerdictCode.NO_MATCH
+                return _fence({"ok": True, "query": query, "count": 0,
+                               "results": [], "verdict": _verdict_block(short)})
             client = _open_client()
             safe_limit = min(max(limit, 1), 50)
             if tiers:
@@ -549,17 +638,47 @@ def build_server() -> FastMCP:
                         f"unknown tiers: {', '.join(unknown)}; "
                         "valid: entity, state, reference, journal"
                     )
-                results = client.search(query, limit=safe_limit, tiers=tier_tuple or None)
+                # `client.search` is the raw primitive and deliberately does not
+                # pay the empty-store probe (it is called once per token by the
+                # linker), so THIS surface pays it, once, only on a zero.
+                results = refine_zero(
+                    client,
+                    client.search(query, limit=safe_limit, tiers=tier_tuple or None))
             else:
                 # Run15 multi-record fix (Terminal B): route workflow search through
                 # retrieve-then-verify so queries spanning several linked records surface
                 # them all. Drop-in (same hit shape). See sibyl_memory_client/multi_record.py.
+                #
+                # 2026-08-31: no `diagnostics=` kwarg here any more, and that is
+                # the point. The old optional dict channel was the reason this
+                # tool shipped unexplained zeros for four eval cycles — the
+                # server simply never passed it. The verdict now rides on the
+                # RETURN, so there is nothing for a call site to forget.
+                #
+                # NO `refine_zero` on this branch. multi_record_search already
+                # resolves EMPTY_STORE at its own single exit, using the entity
+                # COUNT it had to take anyway; calling refine_zero here as well
+                # re-walked all four tables for a question already answered. One
+                # probe per zero was the design, and running it twice is the kind
+                # of quiet cost that makes an explanation channel expensive
+                # enough to switch off.
                 from sibyl_memory_client.multi_record import multi_record_search
                 results = multi_record_search(client, query, limit=safe_limit)
             # MH-1/MH-2: fence-scrub + per-hit cap + total-output budget so
             # attacker-controlled bodies can neither inject nor context-flood.
             bounded = _bound_hits(results)
-            return _fence({"ok": True, "query": query, "count": len(bounded), "results": bounded})
+            verdict = getattr(results, "verdict", None) or no_match_verdict()
+            if len(bounded) != verdict.returned:
+                # The MH-2 output budget can drop rows the engine returned. The
+                # verdict must describe what the AGENT received, not what the
+                # engine produced, or `count` and `verdict.returned` disagree and
+                # the contract test that reads them is measuring a fiction.
+                verdict.returned = len(bounded)
+                if not bounded and verdict.code is VerdictCode.OK:
+                    verdict.code = VerdictCode.NO_MATCH
+            return _fence({"ok": True, "query": query, "count": len(bounded),
+                           "results": bounded,
+                           "verdict": _verdict_block(verdict)})
         except Exception as e:
             return _err(e)
 

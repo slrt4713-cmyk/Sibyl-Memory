@@ -506,7 +506,7 @@ def cmd_upgrade(args: argparse.Namespace) -> int:
     upgrade_url = f"{UPGRADE_BASE}?session={session_token}"
 
     print()
-    print(a.section_header("upgrade", subtitle="lift the 2 MB free-tier cap"))
+    print(a.section_header("upgrade", subtitle="lift the 5 MB free-tier cap"))
     print()
     print(a.kv("Account", short(account_id)))
     print(a.kv("Current tier", current_tier.upper(), value_color="accent"))
@@ -1548,7 +1548,11 @@ def cmd_memory(args: argparse.Namespace) -> int:
     Opens the resolved DB read-only via the SDK; never writes. Respects --db so
     you can inspect any split-brain store that `sibyl status` surfaces.
     """
-    from sibyl_memory_client import MemoryClient
+    from sibyl_memory_client import DEFAULT_TENANT, MemoryClient
+    # THE canonical cause vocabulary (stage 3, 2026-08-31). Imported from the
+    # client, never re-declared here — the CLI prints causes, it does not own
+    # them.
+    from sibyl_memory_client.verdicts import refine_zero
 
     db_path = Path(args.db).expanduser()
     print()
@@ -1556,7 +1560,18 @@ def cmd_memory(args: argparse.Namespace) -> int:
         print(a.warn_line(f"No memory store at {db_path}."))
         print(a.dim("  Run `sibyl status` to see every store on this machine."))
         return 1
-    client = MemoryClient.local(path=db_path)
+    # F1 (Kravento PL eval 2026-08-12): resolve the ACTIVATED tenant exactly like
+    # the MCP server does (Contract T ladder: tenant_id -> account_id ->
+    # DEFAULT_TENANT), so `sibyl memory list/search/recall` reads the same tenant
+    # the MCP writes. Without this the CLI always read DEFAULT_TENANT and an
+    # activated account saw "(no entities)" for a perfectly healthy store. `--creds`
+    # is a root parser arg so args.credentials is present on the real path; a
+    # direct cmd_memory(Namespace(...)) call (CLI-7 unit tests) may omit it, so we
+    # fall back to the parser default resolved at call time.
+    cred_arg = getattr(args, "credentials", None) or str(DEFAULT_CRED_PATH)
+    creds = read_credentials(Path(cred_arg).expanduser()) or {}
+    tenant_id = creds.get("tenant_id") or creds.get("account_id") or DEFAULT_TENANT
+    client = MemoryClient.local(path=db_path, tenant_id=tenant_id)
     op = getattr(args, "mem_cmd", None)
     if op == "list":
         rows = client.list_entities(category=args.category, limit=args.limit)
@@ -1571,9 +1586,21 @@ def cmd_memory(args: argparse.Namespace) -> int:
             print(a.kv(f"{cat}/{name}", r.get("status") or "-"))
         return 0
     if op == "search":
-        hits = client.search(args.query, limit=args.limit)
+        # THE VERDICT CONTRACT (stage 3, 2026-08-31). This used to print
+        # "(no matches)" and stop — the terminal-shaped version of the defect
+        # this stage closes: a zero that cannot explain itself. The SDK now
+        # returns a cause on every call, and `refine_zero` pays one COUNT on the
+        # zero path so a brand-new user is told their store is EMPTY rather than
+        # left to conclude their query was wrong.
+        hits = refine_zero(client, client.search(args.query, limit=args.limit))
         if not hits:
             print(a.dim(f"(no matches for {args.query!r})"))
+            verdict = getattr(hits, "verdict", None)
+            if verdict is not None:
+                # Plain language, generated from the enum and never from stored
+                # text, so it is always safe to print to a terminal.
+                print(a.warn_line(verdict.explain()))
+                print(a.dim(f"cause: {verdict.code.value}"))
             return 0
         print(a.eyebrow(f"matches ({len(hits)})"))
         for h in hits:
