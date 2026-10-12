@@ -753,10 +753,17 @@ class SibylAdapter(MemoryProvider):
                         metadata: dict[str, Any] | None = None) -> None:
         """Mirror built-in `memory` tool writes into Sibyl's warm tier.
 
+        Off unless SIBYL_MIRROR_BUILTIN_MEMORY is "1", "true" or "yes": the
+        entity name is a hash of the content, so every rephrase of an entry
+        created a new near-duplicate entity instead of updating the old one.
+
         Accepts metadata even though we treat it as informational only -
         ignoring the kwarg would TypeError under strict callers.
         """
         if not self._sibyl or not content:
+            return
+        mirror = os.environ.get("SIBYL_MIRROR_BUILTIN_MEMORY", "")
+        if mirror.strip().lower() not in ("1", "true", "yes"):
             return
         name = _stable_key(content)
         try:
