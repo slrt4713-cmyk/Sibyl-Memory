@@ -362,3 +362,50 @@ def test_initialize_never_logs_tenant_value(tmp_path, monkeypatch, caplog):
     unset_lines = [r for r in caplog.records if "Sibyl memory initialized" in r.getMessage()]
     assert unset_lines, "expected an init log line"
     assert all("tenant_override=unset" in r.getMessage() for r in unset_lines)
+
+
+# ----------------------------------------------------------------------
+# Built-in memory mirroring (opt-in)
+# ----------------------------------------------------------------------
+class _RecordingSibyl:
+    def __init__(self):
+        self.calls = []
+
+    def remember(self, **kwargs):
+        self.calls.append(("remember", kwargs))
+
+    def forget(self, **kwargs):
+        self.calls.append(("forget", kwargs))
+
+
+def _adapter_with_recorder():
+    adapter = SibylAdapter()
+    adapter._sibyl = _RecordingSibyl()
+    return adapter
+
+
+def test_builtin_memory_writes_are_not_mirrored_by_default(monkeypatch):
+    """Each rephrase of a built-in memory entry hashed to a new entity, so
+    mirroring filled Sibyl with near-duplicates. It is off unless opted in."""
+    monkeypatch.delenv("SIBYL_MIRROR_BUILTIN_MEMORY", raising=False)
+    adapter = _adapter_with_recorder()
+    adapter.on_memory_write("add", "user", "Prefers drafts without signature")
+    adapter.on_memory_write("remove", "memory", "Old note")
+    assert adapter._sibyl.calls == []
+
+
+@pytest.mark.parametrize("value", ["0", "false", "", "no"])
+def test_builtin_memory_mirroring_stays_off_for_falsy_values(monkeypatch, value):
+    monkeypatch.setenv("SIBYL_MIRROR_BUILTIN_MEMORY", value)
+    adapter = _adapter_with_recorder()
+    adapter.on_memory_write("add", "user", "content")
+    assert adapter._sibyl.calls == []
+
+
+def test_builtin_memory_mirroring_can_be_opted_in(monkeypatch):
+    monkeypatch.setenv("SIBYL_MIRROR_BUILTIN_MEMORY", "1")
+    adapter = _adapter_with_recorder()
+    adapter.on_memory_write("add", "user", "content")
+    adapter.on_memory_write("remove", "user", "content")
+    assert [call[0] for call in adapter._sibyl.calls] == ["remember", "forget"]
+    assert adapter._sibyl.calls[0][1]["name"] == _stable_key("content")
